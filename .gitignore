@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+Pretrained/
+Sample_video/
+# PyInstaller
+#  Usually these files are written by a python script from 
+#  a template before PyInstaller builds the exe, so as to
+#  inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# PyTorch checkpoints, weights, logs
+*.pt
+*.pth
+*.mp4
+checkpoints/
+logs/
+
+# Data files (원천／중간／결과 데이터)
+data/
+datasets/
+Dataset/
+output/
+Results/
+Training/
+video/
+label/
+eval/
+# VS Code
+.vscode/
+
+# Mac OS
+.DS_Store
+
+# Env
+.env
+.venv/
+env/
+venv/
+
+# Editor backups and misc
+*~
+*.swp
