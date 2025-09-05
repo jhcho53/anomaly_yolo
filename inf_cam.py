@@ -197,99 +197,6 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
 _install_torchvision_nms_fallback()
 
 # ======================
-# 유틸 함수
-# ======================
-def expand_box(xyxy, factor, img_w, img_h):
-    x1, y1, x2, y2 = xyxy
-    w = x2 - x1; h = y2 - y1
-    cx = x1 + w / 2.0; cy = y1 + h / 2.0
-    nw = w * factor; nh = h * factor
-    nx1 = max(0, cx - nw / 2.0); ny1 = max(0, cy - nh / 2.0)
-    nx2 = min(img_w - 1, cx + nw / 2.0); ny2 = min(img_h - 1, cy + nh / 2.0)
-    return np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
-def iou_xyxy(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2); inter_y2 = min(ay2, by2)
-    iw = max(0.0, inter_x2 - inter_x1); ih = max(0.0, inter_y2 - inter_y1)
-    inter = iw * ih
-    area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
-    area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
-    union = area_a + area_b - inter + 1e-6
-    return inter / union
-
-def draw_label(img, x, y, text, color, scale=0.5, thickness=1):
-    (tw, th), _ = cv2.getTextSize(text, FONT, scale, thickness)
-    cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y), color, -1)
-    cv2.putText(img, text, (x + 3, y - 4), FONT, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-def _expand_person_roi(pb, w, h, top_extra, side_extra):
-    x1, y1, x2, y2 = pb
-    pw = x2 - x1; ph = y2 - y1
-    nx1 = max(0, x1 - pw * side_extra)
-    nx2 = min(w - 1, x2 + pw * side_extra)
-    ny1 = max(0, y1 - ph * top_extra)
-    ny2 = min(h - 1, y2)
-    return np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
-def _helmet_center_in_head_region(helmet_box, roi, head_ratio):
-    hx1, hy1, hx2, hy2 = helmet_box
-    cx = (hx1 + hx2) / 2.0; cy = (hy1 + hy2) / 2.0
-    rx1, ry1, rx2, ry2 = roi
-    if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
-        return False
-    head_y_limit = ry1 + (ry2 - ry1) * head_ratio
-    return cy <= head_y_limit
-
-# ---------- 클래스 매핑(4cls/7cls 자동) ----------
-def _normalize(s: str):
-    s = s.lower().strip()
-    s = re.sub(r"[_\-\s]+", " ", s)
-    s = re.sub(r"[^a-z0-9 ]", "", s)
-    return " ".join(s.split())
-
-def _find_one(norm_map, candidates):
-    cands = [_normalize(c) for c in candidates]
-    # 1) 정확 일치
-    for i, n in norm_map.items():
-        if n in cands:
-            return i
-    # 2) 부분 포함(양방향)
-    for i, n in norm_map.items():
-        if any(c in n or n in c for c in cands):
-            return i
-    return None
-
-def resolve_class_ids(model):
-    raw = model.names
-    id_to_name = {int(k): v for k, v in (raw.items() if isinstance(raw, dict) else enumerate(raw))}
-    norm_map = {i: _normalize(n) for i, n in id_to_name.items()}
-
-    CANDS = {
-        "person":    ["person"],
-        "pm":        ["pm", "personal mobility", "kickboard", "e scooter", "escooter", "electric scooter", "micromobility", "micro mobility", "e_scooter"],
-        "trash_bag": ["trash bag", "garbage bag", "plastic bag", "trash", "garbage"],
-        "helmet":    ["helmet", "hardhat", "safety helmet"],
-        "fire":      ["fire"],
-        "smoke":     ["smoke"],
-        "weapon":    ["weapon"],
-    }
-
-    ids = {}
-    for key, cands in CANDS.items():
-        idx = _find_one(norm_map, cands)
-        if idx is not None:
-            ids[key] = idx
-
-    required = ["person", "pm", "helmet"]
-    missing = [k for k in required if k not in ids]
-    if missing:
-        raise ValueError(f"[ERROR] 필수 클래스 누락: {missing} | model.names={id_to_name}")
-    return ids
-
-# ======================
 # VLM 헬퍼 (frames→video 폴백)
 # ======================
 def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
@@ -533,7 +440,7 @@ class PMHelmetNode(Node):
 
         # Hazard 로그 쿨다운 타임스탬프
         self.last_hazard_log_time = {
-            "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0
+            "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0, "crowd": 0.0,
         }
 
         # ====== VLM 로딩/버퍼/로그 설정 ======
@@ -866,6 +773,35 @@ class PMHelmetNode(Node):
                 ("smoke",     stats["smoke_count"]),
                 ("weapon",    stats["weapon_count"]),
             ]
+            any_hazard_present = any(cnt > 0 for _, cnt in hazards)
+
+            # (B0) ★ 군집만으로도 VLM 호출 (위험요소가 '하나도 없을 때')
+            if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)) and not any_hazard_present:
+                last_t = self.last_hazard_log_time.get("crowd", 0.0)
+                if (now_t - last_t) >= self.log_cooldown:
+                    frames_for_vlm = self._recent_clip_frames(now_t)
+                    hint = self._build_hint("crowd", total_persons, stats, det_to_track)
+                    qa = _vlm_call_on_frames(
+                        self.vlm_model, self.vlm_tokenizer, frames_for_vlm,
+                        self.gen_cfg_dict, num_segments=self.vlm_segments,
+                        max_num=self.vlm_max_num, fps_for_fallback=self.vlm_target_fps,
+                        prompt=None, lang=self.vlm_lang, hint=hint
+                    )
+                    stem = f"ros_f{int(now_t*1000):013d}_crowd"
+                    img_path = self._save_img_for_vlm(frame, vis, stem) if self.vlm_save_img else ""
+                    extra = {
+                        "persons": total_persons,
+                        "trash_bag": stats["trash_count"],
+                        "fire": stats["fire_count"],
+                        "smoke": stats["smoke_count"],
+                        "weapon": stats["weapon_count"],
+                        "event_detail": "crowd_only"
+                    }
+                    self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="crowd",
+                                    qa_list=qa, extra=extra, image_path=img_path)
+                    self.last_hazard_log_time["crowd"] = now_t
+
+            # (B1) Hazard 존재 시: 기존 로깅 + VLM (변경 없음)
             for name, cnt in hazards:
                 if cnt <= 0:
                     continue
@@ -894,7 +830,7 @@ class PMHelmetNode(Node):
                             "event_detail": f"hazard_{name}"
                         }
                         self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type=name,
-                                         qa_list=qa, extra=extra, image_path=img_path)
+                                        qa_list=qa, extra=extra, image_path=img_path)
 
         # (옵션) any 모드: 검출이 있는 모든 시점, 최소 간격 보장
         if self.vlm_enable and self.vlm_cond == "any" and any_detection:
