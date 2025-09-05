@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vlm_only_infer.py — VLM(InternVL)만 사용해 비디오/프레임에서 QA 캡션 생성
+vlm_only_infer.py — Generate QA captions from videos/frames using VLM (InternVL) only
 
-- GRU 기반 이상탐지 완전 제거
-- 비디오를 고정 길이 청크(clip_sec)로 슬라이싱하여 각 청크를 VLM에 질의
-- 프레임 직접 추론(run_frames_inference) 우선, 불가하면 임시 MP4 → run_video_inference 폴백
-- generation_config는 'use_cache' 유무 두 가지 구성을 순차 시도(버전 차이 안전)
+- Removes any GRU-based anomaly detection.
+- Slices a video into fixed-length clips (clip_sec) and queries the VLM per clip.
+- Prefers frame-direct inference (run_frames_inference); falls back to a temporary MP4
+  then run_video_inference when needed.
+- Tries generation_config twice for robustness across InternVL variants:
+  (1) without 'use_cache', (2) with use_cache=True.
 
-필요 모듈:
-  * utils/video_vlm.py (또는 동일 디렉토리 video_vlm.py):
+Dependencies:
+  * utils/video_vlm.py (or a sibling video_vlm.py) providing:
       - init_model(path, device_map)
       - run_frames_inference(model, tokenizer, frames=..., generation_config=..., num_segments, max_num)
       - run_video_inference(model, tokenizer, video_path, generation_config=..., num_segments, max_num)
@@ -18,14 +20,12 @@ vlm_only_infer.py — VLM(InternVL)만 사용해 비디오/프레임에서 QA �
 import os
 import cv2
 import json
-import time
 import tempfile
 import numpy as np
 from collections import deque
-from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
-# ---- InternVL backends (프레임 우선, 불가 시 비디오 폴백) ----
+# ---- InternVL backends (prefer frames, fallback to video) ----
 try:
     from video_vlm import init_model as vlm_init_model
     from video_vlm import run_frames_inference, run_video_inference
@@ -38,12 +38,12 @@ except Exception:
 
 
 # =========================
-# 0) ROI & 공통 유틸
+# 0) ROI & common utilities
 # =========================
 
 def _ensure_roi_from_first_frame(frames: List[np.ndarray], roi):
     """
-    roi가 None이면 첫 프레임 전체 영역을 ROI로 반환.
+    If roi is None, return a full-frame ROI from the first frame.
     """
     if roi is not None:
         return tuple(map(int, roi))
@@ -52,28 +52,29 @@ def _ensure_roi_from_first_frame(frames: List[np.ndarray], roi):
     h, w = frames[0].shape[:2]
     return (0, 0, w, h)
 
-def _ensure_roi_from_video(video_path: str, roi):
-    if roi is not None:
-        return tuple(map(int, roi))
-    cap = cv2.VideoCapture(video_path)
-    if cap.isOpened():
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        cap.release()
-        if w > 0 and h > 0:
-            return (0, 0, w, h)
-    return None
 
 def _crop_frame(frame_bgr: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
+    """
+    Crop a frame to ROI with bounds clamped to the frame size.
+    Falls back to the original frame if the resulting area is empty.
+    """
+    H, W = frame_bgr.shape[:2]
     x1, y1, x2, y2 = map(int, roi)
+    x1 = max(0, min(W, x1))
+    y1 = max(0, min(H, y1))
+    x2 = max(0, min(W, x2))
+    y2 = max(0, min(H, y2))
+    if x2 <= x1 or y2 <= y1:
+        return frame_bgr
     return frame_bgr[y1:y2, x1:x2]
 
 
 # =========================
-# 1) 임시 mp4 작성(비디오 폴백용)
+# 1) Temporary MP4 writer (for video fallback)
 # =========================
 
 def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
+    """Write BGR frames to a temporary MP4 file and return the path."""
     if not frames:
         raise ValueError("No frames to write.")
     h, w = frames[0].shape[:2]
@@ -89,7 +90,7 @@ def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
 
 
 # =========================
-# 2) VLM 실행 (프레임 → 비디오 폴백 + use_cache 안전화)
+# 2) VLM call (frames-first, video fallback, use_cache robustness)
 # =========================
 
 def _vlm_call_on_frames(
@@ -102,10 +103,10 @@ def _vlm_call_on_frames(
     fps_for_fallback: float = 30.0
 ) -> List[Tuple[str, str]]:
     """
-    InternVL 버전 차이 안전:
-      1) use_cache 미포함(dict)
-      2) use_cache=True 포함(dict)
-    각 후보에 대해 frames 경로 우선 → 비디오 폴백 순서로 시도.
+    Call InternVL robustly across minor API differences:
+      1) Try generation_config without 'use_cache'
+      2) Try again with use_cache=True
+    For each config, try frames-direct → video fallback (temp MP4).
     """
     if not frames:
         return []
@@ -118,9 +119,8 @@ def _vlm_call_on_frames(
         repetition_penalty=float((gen_cfg_dict or {}).get("repetition_penalty", 1.05)),
         temperature=float((gen_cfg_dict or {}).get("temperature", 1.0)),
     )
-    cfg_no_cache = {k: v for k, v in base.items() if k != "use_cache"}  # 보장
+    cfg_no_cache = {k: v for k, v in base.items() if k != "use_cache"}
     cfg_with_cache = dict(cfg_no_cache, use_cache=True)
-
     cfg_candidates = [cfg_no_cache, cfg_with_cache]
 
     def _try_frames(cfg):
@@ -128,8 +128,8 @@ def _vlm_call_on_frames(
             return run_frames_inference(
                 model=vlm_model,
                 tokenizer=vlm_tokenizer,
-                frames=frames,                 # 프레임 직접
-                generation_config=cfg,         # 4번째 위치 인자로 chat()에 전달됨
+                frames=frames,
+                generation_config=cfg,
                 num_segments=num_segments,
                 max_num=max_num
             )
@@ -150,19 +150,21 @@ def _vlm_call_on_frames(
                     max_num=max_num
                 )
             finally:
-                try: os.remove(tmp)
-                except Exception: pass
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[VLM] video inference failed ({'use_cache' in cfg}): {e}")
             return None
 
-    # 1) 프레임 경로 우선
+    # Try frames first
     for cfg in cfg_candidates:
         qa = _try_frames(cfg)
         if qa:
             return qa
 
-    # 2) 비디오 폴백
+    # Fallback to video
     for cfg in cfg_candidates:
         qa = _try_video(cfg)
         if qa:
@@ -173,7 +175,7 @@ def _vlm_call_on_frames(
 
 
 # =========================
-# 3) 프레임 단위 API
+# 3) Frame-level API
 # =========================
 
 def run_vlm_on_frames(
@@ -188,8 +190,8 @@ def run_vlm_on_frames(
     tag: str = "frames_clip"
 ) -> Dict[str, List[Tuple[str, str]]]:
     """
-    메모리에 있는 프레임 리스트를 받아 한 번의 VLM QA를 수행.
-    반환: { tag: [(Q, A), ...] }
+    Run a single VLM QA pass on the in-memory frame list.
+    Returns: { tag: [(Q, A), ...] }
     """
     if not frames:
         return {tag: []}
@@ -208,7 +210,7 @@ def run_vlm_on_frames(
 
 
 # =========================
-# 4) 비디오 스트리밍 청크 API (GRU 없이 고정 길이)
+# 4) Streaming video chunk API (fixed-length, no GRU)
 # =========================
 
 def _iter_video_chunks(
@@ -218,17 +220,16 @@ def _iter_video_chunks(
     process_last: bool = True
 ):
     """
-    OpenCV로 스트리밍 디코드하며 고정 길이 청크를 생성하는 제너레이터.
-    Yields: (chunk_frames: List[np.ndarray], start_frame_idx:int, end_frame_idx:int, fps:float)
+    Stream-decode a video via OpenCV and yield fixed-length chunks.
+    Yields: (chunk_frames: List[np.ndarray], start_frame_idx: int, end_frame_idx: int, fps: float)
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-    if fps <= 1e-3:  # 합리적 기본값
+    if fps <= 1e-3:
         fps = 25.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     clip_frames = max(1, int(round(clip_sec * fps)))
     step_sec = step_sec if step_sec is not None else clip_sec
@@ -236,27 +237,25 @@ def _iter_video_chunks(
 
     buf = deque()
     start_idx = 0
-    read_idx = 0
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         buf.append(frame)
-        read_idx += 1
 
-        # 충분히 쌓였으면 1개 청크 배출
+        # Emit a chunk once enough frames have accumulated
         if len(buf) >= clip_frames:
             frames = list(buf)[:clip_frames]
             end_idx = start_idx + clip_frames - 1
             yield frames, start_idx, end_idx, fps
 
-            # step 만큼 슬라이드
+            # Slide the window by step_frames
             for _ in range(min(step_frames, len(buf))):
                 buf.popleft()
             start_idx = start_idx + step_frames
 
-    # 마지막 잔여 처리
+    # Emit the final (possibly shorter) tail
     if process_last and len(buf) > 0:
         frames = list(buf)
         end_idx = start_idx + len(frames) - 1
@@ -278,12 +277,12 @@ def run_vlm_over_video(
     max_num: int = 1
 ) -> Dict[str, List[Tuple[str, str]]]:
     """
-    비디오를 clip_sec 단위로 슬라이스해 각 청크에 대해 QA 수행.
-    반환: { "s-e(sec)": [(Q,A), ...], ... }
+    Slice a video into clips of length clip_sec and run QA for each chunk.
+    Returns: { "s-e(sec)": [(Q, A), ...], ... }
     """
     results: Dict[str, List[Tuple[str, str]]] = {}
     for frames, s_idx, e_idx, fps in _iter_video_chunks(video_path, clip_sec, step_sec, process_last):
-        # ROI 적용
+        # Apply ROI
         roi_eff = _ensure_roi_from_first_frame(frames, roi)
         if roi_eff is not None:
             frames = [_crop_frame(f, roi_eff) for f in frames]
@@ -302,7 +301,7 @@ def run_vlm_over_video(
 
 
 # =========================
-# 5) 엔드투엔드 래퍼 (이전 인터페이스 유지)
+# 5) End-to-end wrappers (backward compatible)
 # =========================
 
 def run_inference_on_frames(
@@ -317,7 +316,7 @@ def run_inference_on_frames(
     fps_for_vlm_fallback: float = 30.0
 ) -> Dict[str, List[Tuple[str, str]]]:
     """
-    (이전 시그니처 유지) 프레임 리스트 입력 → {tag: [(Q,A), ...]}
+    Backward-compatible wrapper for frame inputs → {tag: [(Q, A), ...]}.
     """
     return run_vlm_on_frames(
         frames=frames,
@@ -334,11 +333,11 @@ def run_inference_on_frames(
 
 def run_inference(
     video_path: str,
-    # VLM 인자
+    # VLM
     vlm_model=None,
     vlm_tokenizer=None,
     generation_config: Optional[dict] = None,
-    # 슬라이싱/전처리
+    # slicing / preprocessing
     clip_sec: float = 3.0,
     step_sec: Optional[float] = None,
     process_last: bool = True,
@@ -347,8 +346,8 @@ def run_inference(
     vlm_max_num: int = 1
 ) -> Dict[str, List[Tuple[str, str]]]:
     """
-    (이전 시그니처 유지) 파일 경로 입력 → { "s-e(sec)": [(Q,A), ...] }
-    내부는 고정 길이 청크 + 프레임 우선/비디오 폴백 공용 로직 사용.
+    Backward-compatible wrapper for file path → {"s-e(sec)": [(Q, A), ...]}.
+    Internally uses fixed-length chunks with frames-first / video-fallback logic.
     """
     if not os.path.exists(video_path):
         raise FileNotFoundError(video_path)
@@ -368,14 +367,14 @@ def run_inference(
 
 
 # =========================
-# 6) 편의 유틸: VLM 로더 + 간단 예제
+# 6) Convenience: VLM loader + simple example
 # =========================
 
 _VLM_CACHE: Dict[str, Tuple[object, object]] = {}
 
 def load_vlm(model_name="OpenGVLab/InternVL3-1B", device_map="auto"):
     """
-    InternVL 로더 캐시 (video_vlm.init_model 사용).
+    Cached VLM loader (delegates to video_vlm.init_model).
     """
     key = f"{model_name}::{device_map}"
     if key in _VLM_CACHE:
@@ -386,7 +385,7 @@ def load_vlm(model_name="OpenGVLab/InternVL3-1B", device_map="auto"):
 
 
 if __name__ == "__main__":
-    # 간단 실행 예시
+    # Minimal runnable example
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--source", type=str, required=True)

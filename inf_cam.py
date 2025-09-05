@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-inf_cam.py — ROS2 Humble 실시간 YOLO one-pass 추론 + 다수결 안정화 + 이벤트 로깅 + InternVL(Only) QA
+inf_cam.py — ROS2 Humble real-time YOLO one-pass inference + majority-vote stabilization + event logging + InternVL-only QA
 
-기능 요약
-- 4클래스 또는 7클래스 가중치(.pt) 자동 지원
+Overview
+- Automatically supports 4-class or 7-class weights (.pt)
   * 4cls: person, pm, trash bag, helmet
   * 7cls: person, pm, trash bag, helmet, fire, smoke, weapon
-- 라이더 판정: PM 박스를 2배 확장 후 person과 IoU > 0.01 이면 Rider
-- 헬멧 판정(라이더만): 머리 ROI(위 20%, 좌우 5%) 상단 60%에 헬멧 박스 중심점 포함 시 Helmet
-- 다수결 안정화: 최근 vote_window 프레임의 헬멧 판정을 과반(vote_threshold)으로 스무딩
-- CSV 로깅:
-  * no_helmet.csv: 라이더가 Helmet→NoHelmet 전이 시(트랙별 쿨다운) 기록
-  * hazard_*.csv: 사람 수 ≥ crowd_person_threshold(기본 6)일 때 trash_bag/fire/smoke/weapon 감지 시(쿨다운) 기록
+- Rider detection: expand a PM box by 2×; if IoU > 0.01 with a person → Rider
+- Helmet detection (riders only): if a helmet box center falls within the upper 60% of the head ROI
+  (ROI = top 20%, left/right ±5%) → Helmet
+- Majority-vote smoothing: smooth helmet state across recent frames (vote_window) using vote_threshold
+- CSV logging:
+  * no_helmet.csv: when a rider transitions Helmet→NoHelmet (per-track cooldown)
+  * hazard_*.csv: when #people ≥ crowd_person_threshold (default 6) and trash_bag/fire/smoke/weapon is detected (cooldown)
 
-추가: InternVL(Only) QA
-- VLM 로드: utils.video_vlm.init_model (device_map="auto" 등 안전 로딩)
-- 이벤트 발생 시 최근 프레임 N초(vlm_clip_sec)만 추출해 단일 턴 QA 수행(바운딩박스 중심 1문장 요약)
-  - 우선 run_frames_inference, 실패 시 임시 mp4 생성 → run_video_inference 폴백
-- JSONL 로깅: logs/vlm_qa.jsonl
-- 옵션: 캡션용 이미지 저장(logs/vlm_images/)
+InternVL (Only) QA
+- VLM load: utils.video_vlm.init_model (safe loading, e.g., device_map="auto")
+- On event, extract the most recent N seconds (vlm_clip_sec) of frames and run single-turn QA
+  (one-sentence summary guided by detection context)
+  - Prefer run_frames_inference; fallback to temporary MP4 + run_video_inference on failure
+- JSONL logging: logs/vlm_qa.jsonl
+- Option: save caption images (logs/vlm_images/)
 """
 
 import os
-import re
 import csv
 import cv2
 import json
-import time
 import tempfile
 import numpy as np
 from pathlib import Path
 from collections import deque
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 import rclpy
 import torch
@@ -50,19 +50,20 @@ from utils.video_vlm import (
     run_frames_inference,
     run_video_inference,
 )
-# ====== 로깅/유틸 ======
-from utils.log import _video_stamp_meta, log_hazard, log_no_helmet
+
+# ====== Logging/utility ======
 from utils.inf_utils import (
     expand_box, iou_xyxy, draw_label,
     _expand_person_roi, _helmet_center_in_head_region,
     resolve_class_ids,
 )
 from model.track import SimpleHelmetTracker
+
 # ======================
-# 기본값(상수)
+# Defaults (constants)
 # ======================
 DEFAULT_WEIGHTS = "Pretrained/4_class.pt"
-DEFAULT_INPUT_TOPIC = "/camera/image_raw"           # 또는 .../compressed
+DEFAULT_INPUT_TOPIC = "/camera/image_raw"           # or .../compressed
 DEFAULT_OUTPUT_TOPIC = "/pm_helmet/image_annotated"
 
 DEFAULT_CONF_THRES = 0.25
@@ -87,37 +88,37 @@ DEFAULT_NO_HELMET_COOLDOWN_SEC = 10.0
 
 DEFAULT_DEVICE = ""        # "", "cpu", "cuda:0"
 DEFAULT_PREVIEW = False
-DEFAULT_IMGSZ = 0         # 0이면 원본 크기 사용(ultralytics 기본)
+DEFAULT_IMGSZ = 0         # 0 → keep original size (Ultralytics default)
 
-# ---- VLM(InternVL Only) 기본값
+# ---- VLM (InternVL Only) defaults
 DEFAULT_VLM_ENABLE = True
 DEFAULT_VLM_MODEL  = "OpenGVLab/InternVL3-1B"
-DEFAULT_VLM_DEVICE_MAP = "auto"     # 'auto' | 'None' | JSON 문자열
+DEFAULT_VLM_DEVICE_MAP = "auto"     # 'auto' | 'None' | JSON string
 DEFAULT_VLM_MAXTOK = 64
 DEFAULT_VLM_COND   = "event"        # 'event' | 'any'
 DEFAULT_VLM_LANG   = "ko"           # 'ko' | 'en'
-DEFAULT_VLM_SAVE_IMG = True         # 캡션용 이미지 저장 여부 (annotated/원본 선택은 아래에서 결정)
-DEFAULT_VLM_MIN_INTERVAL = 1.5      # any 모드에서 QA 최소 간격(초)
-DEFAULT_VLM_CLIP_SEC = 2.0          # 이벤트 시 최근 N초 프레임을 VLM에 투입
+DEFAULT_VLM_SAVE_IMG = True         # Save caption image (annotated/original chosen below)
+DEFAULT_VLM_MIN_INTERVAL = 1.5      # In 'any' mode, minimum QA interval (sec)
+DEFAULT_VLM_CLIP_SEC = 2.0          # Clip length for QA around event (sec)
 DEFAULT_VLM_SEGMENTS = 8            # run_frames_inference num_segments
-DEFAULT_VLM_MAX_NUM  = 1            # InternVL 타일링 최대 수
-DEFAULT_VLM_TARGET_FPS = 15.0       # 실시간 스트림 추정 FPS(버퍼 크기 산정용)
+DEFAULT_VLM_MAX_NUM  = 1            # InternVL tiling upper bound
+DEFAULT_VLM_TARGET_FPS = 15.0       # Estimated FPS for buffer sizing
 
-# 시각화 색상 (BGR)
+# Visualization colors (BGR)
 COLOR_PM      = (255, 160, 0)
 COLOR_PERSON  = (0, 200, 0)
 COLOR_RIDER   = (0, 140, 255)
-COLOR_HELMET  = (0, 0, 255)
 COLOR_TRASH   = (180, 180, 30)
 COLOR_FIRE    = (0, 0, 255)
 COLOR_SMOKE   = (160, 160, 160)
 COLOR_WEAPON  = (180, 0, 180)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+
 def _install_torchvision_nms_fallback(force: bool = False) -> bool:
     """
-    torchvision의 C++ NMS 대신, 순수 PyTorch NMS로 모키 패치.
-    반환: True(폴백 적용) / False(원본 사용)
+    Monkey-patch torchvision NMS with a pure PyTorch fallback when C++ ops are unavailable.
+    Returns: True if fallback is applied, False if original C++ NMS is used.
     """
     try:
         import torchvision
@@ -125,7 +126,7 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
         print(f"[WARN] torchvision import failed: {e} -> using pure PyTorch NMS fallback")
         torchvision = None
 
-    # 순수 PyTorch IoU (벡터화)
+    # Vectorized IoU
     def _box_iou(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         # a: [M,4], b: [N,4] with (x1,y1,x2,y2)
         a = a.float()
@@ -141,6 +142,7 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
 
     def _nms_fallback(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> torch.Tensor:
         """
+        Pure-PyTorch NMS.
         boxes: [N,4], scores: [N]
         return: keep indices (LongTensor)
         """
@@ -165,7 +167,6 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
 
         return torch.tensor(keep, dtype=torch.long, device=device)
 
-    # 모키 패치 조건 판단
     patched = False
     if force:
         try:
@@ -173,19 +174,18 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
             torchvision.ops.nms = _nms_fallback
             patched = True
         except Exception:
-            patched = True  # torchvision 없어도 어차피 원본 못씀
+            patched = True  # torchvision may be absent; fallback only
     else:
         try:
             import torchvision
-            # 원본 NMS가 작동하는지 가볍게 점검
             try:
                 _ = torchvision.ops.nms(torch.zeros((1, 4)), torch.zeros((1,)), 0.5)
-                patched = False  # 정상 동작 → 패치 불필요
+                patched = False  # C++ NMS works
             except Exception:
                 torchvision.ops.nms = _nms_fallback
                 patched = True
         except Exception:
-            patched = True  # torchvision import 자체가 문제 → 폴백만 사용 가능
+            patched = True  # torchvision import failed → fallback only
 
     if patched:
         print("[WARN] Using pure-PyTorch NMS fallback (torchvision C++ ops unavailable).")
@@ -193,13 +193,15 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
         print("[INFO] Using torchvision built-in NMS (C++ ops).")
     return patched
 
-# 실제 적용 (YOLO 사용 전에 호출)
+
+# Apply NMS fallback before using YOLO
 _install_torchvision_nms_fallback()
 
 # ======================
-# VLM 헬퍼 (frames→video 폴백)
+# VLM helpers (frames→video fallback)
 # ======================
 def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
+    """Write frames to a temporary MP4 file and return the path."""
     if not frames:
         raise ValueError("No frames to write.")
     h, w = frames[0].shape[:2]
@@ -213,16 +215,17 @@ def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
     writer.release()
     return path
 
+
 def _vlm_call_on_frames(
     vlm_model, vlm_tokenizer, frames: List[np.ndarray],
     gen_cfg_dict: dict, num_segments=8, max_num=1, fps_for_fallback=15.0,
     prompt: Optional[str] = None, lang: str = "ko", hint: Optional[str] = None
 ):
     """
-    InternVL 버전 차이를 고려해 두 가지 generation_config로 시도:
-      1) use_cache 미포함(dict)
-      2) use_cache=True 포함(dict)
-    각 후보에 대해 frames→video(폴백) 순서로 시도.
+    Try InternVL with two generation configs:
+      1) without 'use_cache'
+      2) with use_cache=True
+    For each config, try frames→video (fallback) in order.
     """
     if not frames:
         return []
@@ -231,7 +234,6 @@ def _vlm_call_on_frames(
     cfg_with_cache = dict(cfg_no_cache, use_cache=True)
     cfg_candidates = [cfg_no_cache, cfg_with_cache]
 
-    # helper: 프레임 직접
     def _try_frames(cfg):
         try:
             return run_frames_inference(
@@ -249,7 +251,6 @@ def _vlm_call_on_frames(
             print(f"[VLM] frames inference failed ({'use_cache' in cfg}): {e}")
             return None
 
-    # helper: 비디오 폴백
     def _try_video(cfg):
         try:
             tmp = _write_frames_to_temp_video(frames, fps_for_fallback)
@@ -274,13 +275,13 @@ def _vlm_call_on_frames(
             print(f"[VLM] video inference failed ({'use_cache' in cfg}): {e}")
             return None
 
-    # 1) frames 경로 우선
+    # Try frames first
     for cfg in cfg_candidates:
         qa = _try_frames(cfg)
         if qa:
             return qa
 
-    # 2) frames 불가 → video 폴백
+    # Fallback to video
     for cfg in cfg_candidates:
         qa = _try_video(cfg)
         if qa:
@@ -289,14 +290,15 @@ def _vlm_call_on_frames(
     print("[VLM] caption failed: all attempts exhausted")
     return []
 
+
 # ======================
-# ROS2 노드
+# ROS2 node
 # ======================
 class PMHelmetNode(Node):
     def __init__(self):
         super().__init__("pm_helmet_inference_vote_log")
 
-        # ---- ROS Parameters 선언
+        # ---- ROS parameter declarations
         self.declare_parameter("weights", DEFAULT_WEIGHTS)
         self.declare_parameter("input_topic", DEFAULT_INPUT_TOPIC)
         self.declare_parameter("output_topic", DEFAULT_OUTPUT_TOPIC)
@@ -325,7 +327,7 @@ class PMHelmetNode(Node):
         self.declare_parameter("preview", DEFAULT_PREVIEW)
         self.declare_parameter("imgsz", DEFAULT_IMGSZ)
 
-        # ---- VLM 파라미터
+        # ---- VLM parameters
         self.declare_parameter("vlm_enable", DEFAULT_VLM_ENABLE)
         self.declare_parameter("vlm_model", DEFAULT_VLM_MODEL)
         self.declare_parameter("vlm_device_map", DEFAULT_VLM_DEVICE_MAP)
@@ -339,7 +341,7 @@ class PMHelmetNode(Node):
         self.declare_parameter("vlm_max_num", DEFAULT_VLM_MAX_NUM)
         self.declare_parameter("vlm_target_fps", DEFAULT_VLM_TARGET_FPS)
 
-        # ---- 파라미터 취득
+        # ---- Get parameters
         self.weights = self.get_parameter("weights").value
         self.input_topic = self.get_parameter("input_topic").value
         self.output_topic = self.get_parameter("output_topic").value
@@ -369,7 +371,7 @@ class PMHelmetNode(Node):
         self.preview = bool(self.get_parameter("preview").value)
         self.imgsz = int(self.get_parameter("imgsz").value)
 
-        # ---- VLM 설정
+        # ---- VLM setup
         self.vlm_enable = bool(self.get_parameter("vlm_enable").value)
         self.vlm_model_name = self.get_parameter("vlm_model").value
         dm_raw = self.get_parameter("vlm_device_map").value
@@ -393,7 +395,7 @@ class PMHelmetNode(Node):
         self.vlm_max_num  = int(self.get_parameter("vlm_max_num").value)
         self.vlm_target_fps = float(self.get_parameter("vlm_target_fps").value)
 
-        # ---- YOLO 모델 로드
+        # ---- Load YOLO
         self.get_logger().info(f"Loading YOLO weights: {self.weights}")
         self.model = YOLO(self.weights)
         if self.device:
@@ -403,11 +405,11 @@ class PMHelmetNode(Node):
             except Exception as e:
                 self.get_logger().warning(f"Failed to move model to '{self.device}': {e}")
 
-        # 클래스 id 매핑(4/7 클래스 자동 지원)
+        # Class id mapping (auto-support for 4/7 classes)
         self.ids = resolve_class_ids(self.model)
         self.get_logger().info(f"Resolved class ids: {self.ids}")
 
-        # 트래커(다수결)
+        # Tracker (majority vote)
         self.tracker = SimpleHelmetTracker(vote_window=vw, vote_min_valid=vm, vote_threshold=vt,
                                            iou_thresh=ti, max_age_frames=ta)
 
@@ -420,7 +422,7 @@ class PMHelmetNode(Node):
 
         self.bridge = CvBridge()
 
-        # 입력 토픽 타입 자동 처리
+        # Input topic type autodetection
         if self.input_topic.endswith("/compressed"):
             self.sub_compressed = self.create_subscription(CompressedImage, self.input_topic, self.compressed_cb, qos)
             self.sub_image = None
@@ -435,15 +437,15 @@ class PMHelmetNode(Node):
         self.get_logger().info(f"Publishing annotated image: {self.output_topic}")
         self.get_logger().info(f"CONF_THRES={self.conf_thres}, IOU_THRES={self.iou_thres}, vote_window={vw}, vote_min_valid={vm}, vote_threshold={vt}")
 
-        # 처리 중 플래그(백프레셔)
+        # Processing flag (simple backpressure)
         self.processing = False
 
-        # Hazard 로그 쿨다운 타임스탬프
+        # Hazard log cooldown timestamps
         self.last_hazard_log_time = {
             "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0, "crowd": 0.0,
         }
 
-        # ====== VLM 로딩/버퍼/로그 설정 ======
+        # ====== VLM loading/buffer/logging ======
         self.vlm_model = None
         self.vlm_tokenizer = None
         self.gen_cfg_dict = dict(
@@ -461,23 +463,28 @@ class PMHelmetNode(Node):
                 self.get_logger().error(f"[VLM] load failed: {e}")
                 self.vlm_enable = False
 
-        # 최근 프레임 버퍼(프레임, 수신시각[sec])
+        # Recent frame buffer: (frame, recv_time_sec)
         maxlen = max(1, int(self.vlm_target_fps * self.vlm_clip_sec * 2))
         self.recent_frames = deque(maxlen=maxlen)
 
-        # VLM 로깅/이미지
+        # VLM logging/images
         self.vlm_images_dir = self.log_dir / "vlm_images"
         self.vlm_images_dir.mkdir(parents=True, exist_ok=True)
         self.vlm_jsonl_path = self.log_dir / "vlm_qa.jsonl"
         self._last_qa_t = -1e9
 
-    # ---------- 코어 추론 + 시각화 ----------
+    # ---------- Core inference + visualization ----------
     def run_inference(self, frame):
         h, w = frame.shape[:2]
-        keep_ids = sorted(set(self.ids.values()))
-        pred_kwargs = dict(conf=self.conf_thres, iou=self.iou_thres, classes=keep_ids, verbose=False)
+
+        # Keep only valid (non-None) class IDs; pass to Ultralytics if non-empty
+        keep_ids = sorted({v for v in self.ids.values() if v is not None})
+        pred_kwargs = dict(conf=self.conf_thres, iou=self.iou_thres, verbose=False)
+        if keep_ids:
+            pred_kwargs["classes"] = keep_ids
         if self.imgsz and self.imgsz > 0:
             pred_kwargs["imgsz"] = self.imgsz
+
         res = self.model.predict(frame, **pred_kwargs)[0]
         if res.boxes is None or len(res.boxes) == 0:
             stats = {
@@ -505,7 +512,7 @@ class PMHelmetNode(Node):
         smoke_boxes   = [xyxy[i] for i, c in enumerate(cls) if c == get("smoke")]      if get("smoke") is not None else []
         weapon_boxes  = [xyxy[i] for i, c in enumerate(cls) if c == get("weapon")]     if get("weapon") is not None else []
 
-        # Rider 판정
+        # Rider decision: PM (expanded ×2) IoU>0.01 with person
         rider_flags = [False] * len(person_boxes)
         for pm in pm_boxes:
             pm2 = expand_box(pm, factor=2.0, img_w=w, img_h=h)
@@ -513,7 +520,7 @@ class PMHelmetNode(Node):
                 if iou_xyxy(pm2, pb) > 0.01:
                     rider_flags[i] = True
 
-        # 헬멧 즉시판정(라이더만)
+        # Instant helmet decision (riders only)
         inst_has_helmet = [False] * len(person_boxes)
         if len(helmet_boxes) > 0:
             for i, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
@@ -525,10 +532,10 @@ class PMHelmetNode(Node):
                         inst_has_helmet[i] = True
                         break
 
-        # 다수결 스무딩(트래커)
+        # Majority-vote smoothing (tracker)
         det_to_track = self.tracker.update(person_boxes, rider_flags, inst_has_helmet)
 
-        # 시각화 — PM
+        # Visualization — PM
         for pm in pm_boxes:
             x1, y1, x2, y2 = pm.astype(int)
             cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_PM, 2)
@@ -536,21 +543,21 @@ class PMHelmetNode(Node):
 
         total_persons = len(person_boxes)
 
-        # 시각화 — Rider(트랙ID + 스무딩 결과)
+        # Visualization — Rider (trackID + smoothed state)
         for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
             if not is_rider:
                 continue
             x1, y1, x2, y2 = pb.astype(int)
             tid, smoothed, _ = det_to_track.get(det_idx, (None, None, False))
             show_has_helmet = smoothed if smoothed is not None else inst_has_helmet[det_idx]
-            label = f"Rider"
+            label = "Rider"
             if tid is not None:
                 label += f"#{tid}"
             label += " | " + ("Helmet" if show_has_helmet else "NoHelmet")
             cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_RIDER, 2)
             draw_label(frame, x1, y1, label, COLOR_RIDER)
 
-        # 시각화 — 일반 Person (사람 수가 임계 이상일 때만)
+        # Visualization — general Person (only when many people)
         if total_persons >= self.person_draw_min_count:
             for (pb, is_rider) in zip(person_boxes, rider_flags):
                 if is_rider:
@@ -561,11 +568,12 @@ class PMHelmetNode(Node):
 
             text = f"Persons: {total_persons}"
             (tw, th), _ = cv2.getTextSize(text, FONT, 0.8, 2)
-            x0 = w - tw - 16; y0 = 16 + th + 8
+            x0 = w - tw - 16
+            y0 = 16 + th + 8
             cv2.rectangle(frame, (x0 - 8, 8), (x0 + tw + 8, y0), (50, 50, 50), -1)
             cv2.putText(frame, text, (x0, 16 + th), FONT, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-        # 기타 클래스 시각화
+        # Visualization — other classes
         for tb in trash_boxes:
             x1, y1, x2, y2 = tb.astype(int)
             cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_TRASH, 2)
@@ -596,7 +604,7 @@ class PMHelmetNode(Node):
         }
         return frame, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats
 
-    # ---------- 로그 유틸 ----------
+    # ---------- CSV logging helpers ----------
     def _append_csv(self, file_path: Path, header: list, row: list):
         existed = file_path.exists()
         with open(file_path, "a", newline="") as f:
@@ -606,17 +614,20 @@ class PMHelmetNode(Node):
             writer.writerow(row)
 
     def _stamp_to_meta(self, header_stamp) -> dict:
+        """Convert ROS header stamp into a dictionary with sec/nsec/iso/float time."""
         if header_stamp is not None:
             sec = int(getattr(header_stamp, "sec", 0))
             nsec = int(getattr(header_stamp, "nanosec", getattr(header_stamp, "nanosec_", 0)))
         else:
             now = self.get_clock().now().to_msg()
-            sec = int(now.sec); nsec = int(now.nanosec)
+            sec = int(now.sec)
+            nsec = int(now.nanosec)
         t = sec + nsec * 1e-9
         iso = datetime.fromtimestamp(t).isoformat()
         return {"sec": sec, "nsec": nsec, "iso": iso, "t": t}
 
     def log_no_helmet(self, stamp_meta, track_id, bbox, persons, vote_window, valid_votes, threshold, helmet_ratio):
+        """Append a No-Helmet transition event into no_helmet.csv."""
         fp = self.log_dir / "no_helmet.csv"
         header = ["stamp_sec","stamp_nsec","iso","track_id","bbox_x1","bbox_y1","bbox_x2","bbox_y2",
                   "persons","vote_window","valid_votes","vote_threshold","helmet_ratio"]
@@ -626,16 +637,18 @@ class PMHelmetNode(Node):
         self._append_csv(fp, header, row)
 
     def log_hazard(self, stamp_meta, event_type, count, persons):
+        """Append a hazard event into hazard_<event>.csv."""
         fp = self.log_dir / f"hazard_{event_type}.csv"
         header = ["stamp_sec","stamp_nsec","iso","event","count","persons"]
         row = [stamp_meta["sec"], stamp_meta["nsec"], stamp_meta["iso"], event_type, count, persons]
         self._append_csv(fp, header, row)
 
-    # ---------- VLM 보조 ----------
+    # ---------- VLM helpers ----------
     def _recent_append(self, frame_bgr: np.ndarray, t_sec: float):
         self.recent_frames.append((frame_bgr, float(t_sec)))
 
     def _recent_clip_frames(self, now_t: float) -> List[np.ndarray]:
+        """Return frames within [now - clip_sec, now]. If empty, return the latest frame if available."""
         t0 = now_t - self.vlm_clip_sec
         frames = [f for (f, ts) in self.recent_frames if ts >= t0]
         if not frames and self.recent_frames:
@@ -643,6 +656,7 @@ class PMHelmetNode(Node):
         return frames
 
     def _save_img_for_vlm(self, raw_bgr, vis_bgr, stem: str) -> str:
+        """Save an image for captioning (annotated or raw) and return its path."""
         img_path = self.vlm_images_dir / f"{stem}.jpg"
         try:
             cv2.imwrite(str(img_path), vis_bgr if self.vlm_save_img else raw_bgr)
@@ -651,6 +665,7 @@ class PMHelmetNode(Node):
             return ""
 
     def _log_vlm_qa(self, stamp_meta, frame_idx: int, event_type: str, qa_list, extra=None, image_path=""):
+        """Append a VLM QA record into logs/vlm_qa.jsonl."""
         rec = {
             "stamp_iso": stamp_meta["iso"],
             "ros_stamp": {"sec": int(stamp_meta["sec"]), "nsec": int(stamp_meta["nsec"])},
@@ -669,6 +684,7 @@ class PMHelmetNode(Node):
             self.get_logger().error(f"[VLM] jsonl append failed: {e}")
 
     def _build_hint(self, event_type: str, total_persons: int, stats: dict, det_to_track: dict) -> str:
+        """Compose a concise hint string summarizing scene context for InternVL."""
         rider_flags = stats.get("rider_flags", [])
         inst_has_helmet = stats.get("inst_has_helmet", [])
         helmet_on = helmet_off = helmet_unknown = 0
@@ -697,18 +713,18 @@ class PMHelmetNode(Node):
         )
         return hint
 
-    # ---------- 콜백 공통 처리 ----------
+    # ---------- Unified processing/publish ----------
     def _process_and_publish(self, frame, header):
-        # 1) 타임스탬프 확보 + 최근 프레임 버퍼 추가(원본)
+        # 1) Timestamp + push original frame into recent buffer
         stamp_meta = self._stamp_to_meta(header.stamp if header else None)
         now_t = stamp_meta["t"]
         self._recent_append(frame.copy(), now_t)
 
-        # 2) 추론/시각화는 별도 복사본으로 수행(원본 보존)
+        # 2) Run inference/visualization on a copy
         work = frame.copy()
         vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats = self.run_inference(work)
 
-        # ===== CSV 로깅 & (옵션) VLM =====
+        # Determine if any detection exists
         any_detection = (
             total_persons > 0 or
             stats["trash_count"] > 0 or
@@ -720,7 +736,7 @@ class PMHelmetNode(Node):
         det_to_track = stats["det_to_track"]
         rider_flags = stats["rider_flags"]
 
-        # (A) 무헬멧(다수결) — 상태 전이 시 로깅(트랙별 쿨다운) + VLM
+        # (A) No-helmet (majority vote) — log on state transition (per-track cooldown) + VLM
         for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
             if not is_rider:
                 continue
@@ -740,7 +756,7 @@ class PMHelmetNode(Node):
                                        self.tracker.vote_threshold, ratio)
                     tr.last_nohelmet_log_time = now_t
 
-                    # ---- VLM (event 모드 또는 any+검출)
+                    # VLM (on 'event' mode, or 'any' mode with detection)
                     if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
                         frames_for_vlm = self._recent_clip_frames(now_t)
                         hint = self._build_hint("no_helmet", total_persons, stats, det_to_track)
@@ -764,7 +780,7 @@ class PMHelmetNode(Node):
                         self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="no_helmet",
                                          qa_list=qa, extra=extra, image_path=img_path)
 
-        # (B) 군집(사람 ≥ 임계) + Hazard 로깅(쿨다운) + VLM
+        # (B) Crowd (persons ≥ threshold) + hazard logging (cooldown) + VLM
         is_crowd = (total_persons >= self.crowd_person_threshold)
         if is_crowd:
             hazards = [
@@ -773,9 +789,9 @@ class PMHelmetNode(Node):
                 ("smoke",     stats["smoke_count"]),
                 ("weapon",    stats["weapon_count"]),
             ]
-            any_hazard_present = any(cnt > 0 for _, cnt in hazards)
+            any_hazard_present = any(count > 0 for _, count in hazards)
 
-            # (B0) ★ 군집만으로도 VLM 호출 (위험요소가 '하나도 없을 때')
+            # (B0) Call VLM even for crowd-only scenes (no explicit hazards) when cooldown allows
             if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)) and not any_hazard_present:
                 last_t = self.last_hazard_log_time.get("crowd", 0.0)
                 if (now_t - last_t) >= self.log_cooldown:
@@ -798,16 +814,16 @@ class PMHelmetNode(Node):
                         "event_detail": "crowd_only"
                     }
                     self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="crowd",
-                                    qa_list=qa, extra=extra, image_path=img_path)
+                                     qa_list=qa, extra=extra, image_path=img_path)
                     self.last_hazard_log_time["crowd"] = now_t
 
-            # (B1) Hazard 존재 시: 기존 로깅 + VLM (변경 없음)
-            for name, cnt in hazards:
-                if cnt <= 0:
+            # (B1) Log hazards when present (per-type cooldown) + VLM
+            for name, count in hazards:
+                if count <= 0:
                     continue
                 last_t = self.last_hazard_log_time.get(name, 0.0)
                 if (now_t - last_t) >= self.log_cooldown:
-                    self.log_hazard(stamp_meta, name, cnt, total_persons)
+                    self.log_hazard(stamp_meta, name, count, total_persons)
                     self.last_hazard_log_time[name] = now_t
 
                     if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
@@ -830,9 +846,9 @@ class PMHelmetNode(Node):
                             "event_detail": f"hazard_{name}"
                         }
                         self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type=name,
-                                        qa_list=qa, extra=extra, image_path=img_path)
+                                         qa_list=qa, extra=extra, image_path=img_path)
 
-        # (옵션) any 모드: 검출이 있는 모든 시점, 최소 간격 보장
+        # (C) 'any' mode: run QA whenever there is any detection, respecting min interval
         if self.vlm_enable and self.vlm_cond == "any" and any_detection:
             if (now_t - self._last_qa_t) >= self.vlm_min_interval:
                 frames_for_vlm = self._recent_clip_frames(now_t)
@@ -857,18 +873,18 @@ class PMHelmetNode(Node):
                                  qa_list=qa, extra=extra, image_path=img_path)
                 self._last_qa_t = now_t
 
-        # 퍼블리시
+        # Publish annotated image
         out = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
         if header:
             out.header = header
         self.pub.publish(out)
 
-        # 미리보기
+        # Optional preview window
         if self.preview:
             cv2.imshow("PM/Rider/Helmet (ROS2)", vis)
             cv2.waitKey(1)
 
-    # ---------- ROS 콜백 ----------
+    # ---------- ROS callbacks ----------
     def image_cb(self, msg: Image):
         if self.processing:
             return
@@ -884,7 +900,7 @@ class PMHelmetNode(Node):
     def compressed_cb(self, msg: CompressedImage):
         if self.processing:
             return
-        self.processing = True        # 간단한 백프레셔
+        self.processing = True  # simple backpressure
         try:
             frame = self.bridge.compressed_imgmsg_to_cv2(msg)
             if frame.ndim == 2:
@@ -895,8 +911,9 @@ class PMHelmetNode(Node):
         finally:
             self.processing = False
 
+
 # ======================
-# 엔트리포인트
+# Entry point
 # ======================
 def main():
     rclpy.init()
@@ -913,6 +930,7 @@ def main():
                 pass
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()

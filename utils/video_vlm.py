@@ -37,6 +37,7 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
 def build_transform(input_size: int):
+    """Return a torchvision transform for RGB conversion, resize, tensorize, and normalization."""
     return T.Compose([
         T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
         T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
@@ -46,6 +47,7 @@ def build_transform(input_size: int):
 
 
 def find_closest_aspect_ratio(ar, target_ratios, w, h, image_size):
+    """Pick (i, j) whose i/j is closest to the given aspect ratio with a tie-break on covered area."""
     best, diff = (1, 1), float('inf')
     area = w * h
     for i, j in target_ratios:
@@ -58,7 +60,11 @@ def find_closest_aspect_ratio(ar, target_ratios, w, h, image_size):
 
 def dynamic_preprocess(image: Image.Image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
     """
-    InternVL 비전 타워에서 사용하는 멀티-타일 전처리.
+    Multi-tile preprocessing used by InternVL vision tower.
+
+    Given an input image, choose a grid (i x j) whose aspect ratio is closest to the image,
+    resize to (i*image_size, j*image_size), and crop tiles of size (image_size, image_size).
+    Optionally append a single thumbnail when multiple tiles exist.
     """
     w, h = image.size
     ar = w / h
@@ -85,8 +91,8 @@ def dynamic_preprocess(image: Image.Image, min_num=1, max_num=12, image_size=448
 
 def split_model(model_name):
     """
-    (선택) 다중 GPU용 장치 맵 헬퍼.
-    주의: 기본적으로 사용하지 않습니다. 사용시 루트 키("")를 반드시 넣으세요.
+    Optional helper for manual multi-GPU device maps.
+    NOTE: Not used by default. If used, ensure the root key ('') exists.
     """
     cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     layers = getattr(getattr(cfg, 'llm_config', cfg), 'num_hidden_layers', None)
@@ -97,7 +103,7 @@ def split_model(model_name):
         return {}
     per = math.ceil(layers / (gpus - 0.5))
     counts = [math.ceil(per * 0.5)] + [per] * (gpus - 1)
-    dm = {"": 0}  # ★ 루트 기본은 GPU0
+    dm = {"": 0}  # root defaults to GPU 0
     cnt = 0
     for gpu, num in enumerate(counts):
         for _ in range(num):
@@ -107,6 +113,7 @@ def split_model(model_name):
             cnt += 1
         if cnt >= layers:
             break
+    # Pin common non-layer modules to GPU 0
     for key in ['vision_model', 'mlp1',
                 'language_model.model.tok_embeddings',
                 'language_model.model.embed_tokens',
@@ -121,10 +128,10 @@ def split_model(model_name):
 
 def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "auto"):
     """
-    InternVL 로더 (안정성 우선):
-      - dtype: CUDA면 FP16, 아니면 FP32
-      - device_map 기본 "auto" (가장 안전)
-      - 호환성 fallback: dtype → torch_dtype, device_map={"": "cuda:0"} → None
+    InternVL loader (robust-first):
+      - dtype: FP16 on CUDA, FP32 otherwise
+      - device_map: "auto" by default (safest)
+      - compatibility fallbacks for torch_dtype/device_map issues
     """
     use_cuda = torch.cuda.is_available()
     prefer_dtype = torch.float16 if use_cuda else torch.float32
@@ -134,15 +141,15 @@ def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "au
         low_cpu_mem_usage=True,
     )
 
-    # device_map 처리
+    # device_map handling
     if device_map is None:
         pass
     elif device_map == "auto":
         kwargs["device_map"] = "auto"
     else:
-        kwargs["device_map"] = device_map  # 사용자가 직접 넘긴 맵
+        kwargs["device_map"] = device_map  # pass through user-provided map
 
-    # 1차: 최신 Transformers는 dtype 인자를 권장
+    # Primary attempt: modern Transformers prefer 'dtype'
     try:
         model = AutoModel.from_pretrained(
             path,
@@ -150,14 +157,14 @@ def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "au
             **kwargs
         ).eval()
     except TypeError:
-        # 구버전 호환: torch_dtype 사용
+        # Fallback for older versions: 'torch_dtype'
         model = AutoModel.from_pretrained(
             path,
             torch_dtype=prefer_dtype,
             **kwargs
         ).eval()
     except KeyError:
-        # device_map에서 키 누락 등 발생 시: 루트 매핑으로 재시도
+        # Fallback for device_map/key issues: try root mapping
         try:
             km = kwargs.copy()
             km["device_map"] = {"": "cuda:0"} if use_cuda else None
@@ -167,7 +174,7 @@ def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "au
                 **km
             ).eval()
         except Exception:
-            # 최후 수단: device_map 완전 해제 후 로드 → 이후 to(cuda)
+            # Last resort: disable device_map and move afterwards if CUDA is available
             model = AutoModel.from_pretrained(
                 path,
                 dtype=prefer_dtype,
@@ -182,6 +189,7 @@ def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "au
 
 
 def get_frame_indices(bound, fps, max_frame, num_segments, first_idx=0):
+    """Compute evenly spaced frame indices within time bound at given fps."""
     if bound:
         s, e = bound
     else:
@@ -194,6 +202,7 @@ def get_frame_indices(bound, fps, max_frame, num_segments, first_idx=0):
 
 # ------------------------- Backend helpers -------------------------
 def _safe_fps(val, default=25.0):
+    """Return a sensible FPS value, falling back to default if invalid."""
     try:
         v = float(val)
         return v if v > 1e-6 else default
@@ -209,6 +218,7 @@ def _meta_decord(video_path):
 
 
 def _frames_decord(vr, indices):
+    """Read frames (RGB) from Decord by indices."""
     frames = []
     for idx in indices:
         arr = vr[idx].asnumpy()  # RGB
@@ -227,6 +237,7 @@ def _meta_opencv(video_path):
 
 
 def _frames_opencv(cap, indices):
+    """Random-access frames (RGB) via OpenCV with last-valid fallback."""
     frames = []
     last_valid = None
     for idx in indices:
@@ -255,6 +266,7 @@ def _meta_pyav(video_path):
         max_frame = int(vstream.frames) - 1
         container.close()
         return fps, max_frame
+    # If frame count is unknown, decode to count
     cnt = 0
     for _ in container.decode(video=0):
         cnt += 1
@@ -264,6 +276,7 @@ def _meta_pyav(video_path):
 
 
 def _frames_pyav(video_path, indices):
+    """Decode selected frames (RGB) via PyAV with sparse retrieval and last-valid fallback."""
     idx_set = set(int(i) for i in indices)
     max_idx = max(idx_set) if idx_set else -1
     out = {}
@@ -289,17 +302,18 @@ def _frames_pyav(video_path, indices):
 
 def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
     """
-    video_path에서 프레임을 읽어 InternVL 전처리(타일링)까지 수행.
-    반환:
-      pixel_values: [sum_patches, 3, H, W] float32 (나중에 bfloat16/float16 캐스팅)
-      patch_counts: 각 프레임 당 타일 개수 리스트
+    Read frames from a file path and perform InternVL tiling preprocessing.
+
+    Returns:
+      pixel_values: torch.FloatTensor of shape [sum_patches, 3, H, W]
+      patch_counts: list of number of tiles per frame (length == #frames)
     """
     transform = build_transform(input_size)
 
     backend_used = None
     frames_np = []
-    patch_counts = []
 
+    # Preferred: Decord
     try:
         if _USE_DECORD:
             vr, fps, max_frame = _meta_decord(video_path)
@@ -309,6 +323,7 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
         else:
             raise RuntimeError("Decord not available")
     except Exception:
+        # Fallback: OpenCV (with PyAV assistance if frame count unknown)
         if _HAVE_CV2:
             try:
                 cap, fps, max_frame = _meta_opencv(video_path)
@@ -321,6 +336,7 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
                         except Exception:
                             pass
                     if max_frame is None:
+                        # Bruteforce count frames if necessary
                         count = 0
                         ok = True
                         while ok:
@@ -337,6 +353,7 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
             except Exception:
                 backend_used = None
 
+        # Last resort: PyAV
         if backend_used is None and _HAVE_AV:
             fps, max_frame = _meta_pyav(video_path)
             indices = get_frame_indices(bound, fps, max_frame, num_segments)
@@ -346,18 +363,18 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
     if backend_used is None or not frames_np:
         raise ImportError(
             "No usable video backend found. Install one of:\n"
-            "- decord (source build on Jetson), or\n"
-            "- OpenCV (apt-get install -y python3-opencv), or\n"
+            "- decord (often source build on Jetson), or\n"
+            "- OpenCV (e.g., apt-get install -y python3-opencv), or\n"
             "- PyAV (pip install av)."
         )
 
-    # Preprocess into tiles/patches
+    # Preprocess frames into tiles/patches
     pixel_vals = []
     patch_counts = []
     for arr in frames_np:
         img = Image.fromarray(arr).convert('RGB')
         tiles = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
-        tv = torch.stack([transform(t) for t in tiles])
+        tv = torch.stack([transform(t) for t in tiles])  # [P,3,H,W]
         patch_counts.append(tv.shape[0])
         pixel_vals.append(tv)
 
@@ -365,15 +382,20 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
 
 
 def prepare_video_prompts(num_patches_list):
+    """Return a prefix prompt enumerating frames as '<image>' placeholders."""
     return ''.join([f'Frame{i+1}: <image>\n' for i in range(len(num_patches_list))])
 
 # --------------------- BBox-focused single prompt --------------------- #
 _DEFAULT_PROMPT_EN = (
-    "In one concise sentence, summarize the scene from a safety perspective with a bounding‑box focus. "
+    "In one concise sentence, summarize the scene from a safety perspective with a bounding‑box focus."
+)
+_DEFAULT_PROMPT_KO = (
+    "안전 관점에서 바운딩 박스를 중심으로 장면을 한 문장으로 간결하게 요약하세요."
 )
 
 def _build_bbox_prompt(lang: str = "ko", hint: Optional[str] = None) -> str:
-    base = _DEFAULT_PROMPT_EN if (lang or "").lower().startswith("ko") else _DEFAULT_PROMPT_EN
+    """Build a short, safety-focused caption prompt in the requested language (ko/en)."""
+    base = _DEFAULT_PROMPT_KO if (lang or "").lower().startswith("ko") else _DEFAULT_PROMPT_EN
     if hint:
         return f"{base}\nHint: {hint}"
     return base
@@ -381,25 +403,33 @@ def _build_bbox_prompt(lang: str = "ko", hint: Optional[str] = None) -> str:
 
 
 def _to_device_dtype(pv: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
-    device = next(model.parameters()).device
-    return pv.to(torch.float16 if device.type == "cuda" else torch.float32).to(device)
+    """
+    Move tensor to the model's device and use FP16 on CUDA, FP32 otherwise.
+    Handles models with no parameters by falling back to CUDA if available.
+    """
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    return pv.to(dtype=dtype, device=device)
 
 
 def _call_chat_single_turn(model, tokenizer, pixel_values, prompt, generation_config, **kwargs):
     """
-    InternVL 구현 차이를 고려한 안전 호출자.
-    1) 가장 단순한 서명으로 호출
-    2) 실패 시 num_patches_list/history/return_history 변화해 재시도
-    3) 최종 실패 시 예외 전파
+    Safe caller for InternVL's .chat considering minor API differences:
+      1) Try the canonical signature.
+      2) Retry variants toggling 'return_history' and 'history=None'.
+      3) Propagate the last error on failure.
     """
-    # 1) 가장 단순한 형태 (권장)
+    # 1) Canonical form
     try:
         out = model.chat(tokenizer, pixel_values, prompt, generation_config, **kwargs)
         return out[0] if isinstance(out, tuple) else out
     except TypeError:
         pass
 
-    # 2) return_history 제거/추가 등 가변 시도
+    # 2) Retry with slight variations
     trial_kwargs = [
         kwargs,  # as-is
         {k: v for k, v in kwargs.items() if k != "return_history"},
@@ -431,9 +461,9 @@ def run_video_inference(
     hint: Optional[str] = None
 ) -> List[Tuple[str, str]]:
     """
-    파일 경로 방식(단일 턴):
-      - 비디오에서 일정 간격 프레임 추출 → 타일 전처리 → 단일 프롬프트 질의
-      - 반환은 [(prompt_used, answer)] 1개만
+    Single-turn QA from a video file path:
+      - Sample frames within a bound → tile preprocessing → single prompt query.
+      - Returns a single pair: [(prompt_used, answer)].
     """
     pv, patch_list = load_video(video_path, bound, input_size, max_num, num_segments)
     pv = _to_device_dtype(pv, model)
@@ -441,25 +471,26 @@ def run_video_inference(
     prefix = prepare_video_prompts(patch_list)
     final_prompt = prefix + (prompt if prompt else _build_bbox_prompt(lang=lang, hint=hint))
 
-    # InternVL 호출
     answer = _call_chat_single_turn(
         model, tokenizer, pv, final_prompt, generation_config,
-        num_patches_list=patch_list  # InternVL에서 패치 수를 알려주는 케이스 지원
+        num_patches_list=patch_list  # some InternVL variants expect this
     )
     return [(final_prompt, answer)]
 
 
 # ======================= frames_direct support =========================
 def _uniform_indices_from_length(total: int, num_segments: int) -> List[int]:
+    """Uniformly pick indices from [0, total-1] inclusive."""
     if total <= 0:
         return []
     num_segments = max(1, int(num_segments))
     if num_segments == 1:
-        return [total - 1]  # 마지막 프레임 하나(게이팅용)
+        return [total - 1]
     return np.linspace(0, total - 1, num_segments).astype(int).tolist()
 
 
 def _bgr_ndarray_to_pil_rgb(arr: np.ndarray) -> Image.Image:
+    """Convert BGR ndarray to a PIL RGB image (uses cv2 if available)."""
     if arr is None:
         raise ValueError("Empty frame array.")
     if _HAVE_CV2:
@@ -474,6 +505,7 @@ def _frames_to_pixel_values(
     input_size: int = 448,
     max_num: int = 1
 ) -> Tuple[torch.Tensor, List[int]]:
+    """Convert a list of BGR frames to tiled, normalized pixel tensors with patch counts."""
     transform = build_transform(input_size)
     pixel_vals = []
     patch_counts: List[int] = []
@@ -502,29 +534,29 @@ def run_frames_inference(
     **kwargs
 ) -> List[Tuple[str, str]]:
     """
-    프레임 직접 방식(단일 턴):
-      - list[np.ndarray(BGR)] → 균등 샘플링 → 타일 전처리 → 단일 프롬프트 질의
-      - 반환은 [(prompt_used, answer)] 1개만
-      - frames_bgr 또는 frames 키워드로 입력 가능(호환)
+    Single-turn QA from frames (BGR ndarray list):
+      - Uniformly sample frames → tile preprocessing → single prompt query.
+      - Returns a single pair: [(prompt_used, answer)].
+      - Also accepts 'frames' kwarg for compatibility.
     """
-    # 호환성: frames 키워드도 허용
+    # Backward-compat: accept frames via 'frames' kwarg
     if frames_bgr is None:
         frames_bgr = kwargs.pop("frames", None)
 
-    # 프레임 없음 → 기본 프롬프트만 반환(응답은 빈 문자열)
     prompt_used = (prompt if prompt else _build_bbox_prompt(lang=lang, hint=hint))
     if not isinstance(frames_bgr, list) or len(frames_bgr) == 0:
+        # No frames: return prompt with empty answer
         return [(prompt_used, "")]
 
-    # 1) 프레임 균등 샘플링
+    # 1) Uniform sampling
     idxs = _uniform_indices_from_length(len(frames_bgr), num_segments)
     sampled = [frames_bgr[i] for i in idxs]
 
-    # 2) 전처리(타일링) -> pixel_values + 각 프레임별 타일 수
+    # 2) Preprocess → pixel_values + tile counts
     pv, patch_list = _frames_to_pixel_values(sampled, input_size=input_size, max_num=max_num)
     pv = _to_device_dtype(pv, model)
 
-    # 3) 프롬프트 + 질의
+    # 3) Compose and query
     prefix = prepare_video_prompts(patch_list)
     final_prompt = prefix + prompt_used
 
