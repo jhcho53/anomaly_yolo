@@ -49,7 +49,14 @@ from utils.video_vlm import (
     run_frames_inference,
     run_video_inference,
 )
-
+# ====== 로깅/유틸 ======
+from utils.log import _video_stamp_meta, log_hazard, log_no_helmet
+from utils.inf_utils import (
+    expand_box, iou_xyxy, draw_label,
+    _expand_person_roi, _helmet_center_in_head_region,
+    resolve_class_ids,
+)
+from model.track import SimpleHelmetTracker
 # ======================
 # 기본값(상수)
 # ======================
