@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-inf_video_vlm.py — Local Video → YOLO one-pass + Majority Vote + CSV Event Logs + InternVL3-1B Captions
+inf_video.py — Local Video → YOLO one-pass + Majority Vote + CSV Event Logs + InternVL QA (frames→video 폴백)
 
 - 4/7 클래스 자동 지원 (person/pm/trash_bag/helmet[/fire/smoke/weapon])
 - Rider/Helmet 판정 + 다수결 안정화 + CSV 이벤트 로깅
-- InternVL3-1B로 이벤트 프레임 캡션 생성 + 이미지/JSONL 로깅
-- VLM 로딩은 사용자 제공 init_model() 함수를 그대로 사용(device_map="auto" 기본)
+- InternVL(Only) 로드: utils.video_vlm.init_model
+- 이벤트 발생 시 최근 프레임 버퍼를 VLM에 투입:
+  * 우선: utils.video_vlm.run_frames_inference
+  * 폴백: 임시 mp4 생성 → utils.video_vlm.run_video_inference
+- VLM 결과(JSONL): runs/.../logs/vlm_qa.jsonl
 
-의존성:
-  pip install --no-deps --no-cache-dir ultralytics pillow transformers accelerate sentencepiece safetensors
-  (PyTorch는 Jetson용 CUDA 빌드 유지! --no-deps 사용)
+옵션:
+  --vlm_input_annotated 0|1
+    0: 원본 프레임을 VLM 입력으로 사용(기본, 권장)
+    1: 박스가 그려진 주석 프레임을 VLM 입력으로 사용(디버깅용)
 """
 
 import os
 import re
-import csv
 import cv2
-import time
+import csv
 import json
+import time
 import argparse
+import tempfile
 import numpy as np
 from pathlib import Path
 from collections import deque
-from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from ultralytics import YOLO
+
+# ====== VLM import (InternVL 전용) ======
+from utils.video_vlm import (
+    init_model as vlm_init_model,
+    run_frames_inference,
+    run_video_inference,
+)
+# ====== 로깅/유틸 ======
+from utils.log import _video_stamp_meta, log_hazard, log_no_helmet
+from utils.inf_utils import (
+    expand_box, iou_xyxy, draw_label,
+    _expand_person_roi, _helmet_center_in_head_region,
+    resolve_class_ids,
+)
+from model.track import SimpleHelmetTracker
 
 # ======================
 # 기본값(상수)
@@ -56,24 +75,28 @@ DEFAULT_NO_HELMET_COOLDOWN_SEC = 10.0
 
 DEFAULT_DEVICE = ""        # "", "cpu", "cuda:0"
 DEFAULT_PREVIEW = False
-DEFAULT_IMGSZ = 0         # 0이면 원본 크기(ultralytics 기본)
+DEFAULT_IMGSZ = 0
 DEFAULT_OUT_SUFFIX = "_out.mp4"
 
-# ---- VLM(InternVL3-1B) 기본값
+# ---- VLM(InternVL Only)
 DEFAULT_VLM_ENABLE = True
 DEFAULT_VLM_MODEL  = "OpenGVLab/InternVL3-1B"
-DEFAULT_VLM_DEVICE_MAP = "auto"  # "auto" | "None" | JSON 문자열
+DEFAULT_VLM_DEVICE_MAP = "auto"     # "auto" | "None" | JSON 문자열
 DEFAULT_VLM_MAXTOK = 64
-DEFAULT_VLM_COND   = "event"     # "event" | "any"
-DEFAULT_VLM_LANG   = "ko"        # "ko" | "en"
-DEFAULT_VLM_SAVE_ANN = True      # True: 주석 프레임 저장, False: 원본 프레임 저장
-DEFAULT_VLM_MIN_INTERVAL = 1.5   # any 모드에서 캡션 최소 간격(초)
+DEFAULT_VLM_COND   = "event"        # "event" | "any"
+DEFAULT_VLM_LANG   = "ko"           # "ko" | "en"
+DEFAULT_VLM_SAVE_IMG = True         # True: 캡션용 이미지 저장
+DEFAULT_VLM_MIN_INTERVAL = 1.5      # any 모드에서 캡션 최소 간격(초)
+DEFAULT_VLM_CLIP_SEC = 2.0          # 이벤트 시 마지막 N초 프레임을 VLM에 투입
+DEFAULT_VLM_SEGMENTS = 8            # run_frames_inference num_segments
+DEFAULT_VLM_MAX_NUM  = 1            # InternVL 타일링 최대 수 (video_vlm)
+DEFAULT_VLM_INPUT_ANNOTATED = 0     # 1: VLM 입력으로 주석 프레임 사용, 0: 원본 프레임 사용
 
 # 시각화 색상 (BGR)
 COLOR_PM      = (255, 160, 0)
 COLOR_PERSON  = (0, 200, 0)
 COLOR_RIDER   = (0, 140, 255)
-COLOR_HELMET  = (0, 0, 255)    # (라벨 배경 색상용, 헬멧 박스 그리진 않음)
+COLOR_HELMET  = (0, 0, 255)
 COLOR_TRASH   = (180, 180, 30)
 COLOR_FIRE    = (0, 0, 255)
 COLOR_SMOKE   = (160, 160, 160)
@@ -81,348 +104,86 @@ COLOR_WEAPON  = (180, 0, 180)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # ======================
-# 유틸
+# VLM 헬퍼(프레임→비디오 폴백 포함)
 # ======================
-def expand_box(xyxy, factor, img_w, img_h):
-    x1, y1, x2, y2 = xyxy
-    w = x2 - x1; h = y2 - y1
-    cx = x1 + w / 2.0; cy = y1 + h / 2.0
-    nw = w * factor; nh = h * factor
-    nx1 = max(0, cx - nw / 2.0); ny1 = max(0, cy - nh / 2.0)
-    nx2 = min(img_w - 1, cx + nw / 2.0); ny2 = min(img_h - 1, cy + nh / 2.0)
-    return np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
+def _write_frames_to_temp_video(frames: List[np.ndarray], fps: float) -> str:
+    if not frames:
+        raise ValueError("No frames to write.")
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    path = tmp.name
+    tmp.close()
+    writer = cv2.VideoWriter(path, fourcc, max(fps, 1.0), (w, h))
+    for f in frames:
+        writer.write(f)
+    writer.release()
+    return path
 
-def iou_xyxy(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    inter_x1 = max(ax1, bx1); inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2); inter_y2 = min(ay2, by2)
-    iw = max(0.0, inter_x2 - inter_x1); ih = max(0.0, inter_y2 - inter_y1)
-    inter = iw * ih
-    area_a = max(0.0, (ax2 - ax1)) * max(0.0, (ay2 - ay1))
-    area_b = max(0.0, (bx2 - bx1)) * max(0.0, (by2 - by1))
-    union = area_a + area_b - inter + 1e-6
-    return inter / union
-
-def draw_label(img, x, y, text, color, scale=0.5, thickness=1):
-    (tw, th), _ = cv2.getTextSize(text, FONT, scale, thickness)
-    cv2.rectangle(img, (x, y - th - 6), (x + tw + 6, y), color, -1)
-    cv2.putText(img, text, (x + 3, y - 4), FONT, scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-def _expand_person_roi(pb, w, h, top_extra, side_extra):
-    x1, y1, x2, y2 = pb
-    pw = x2 - x1; ph = y2 - y1
-    nx1 = max(0, x1 - pw * side_extra)
-    nx2 = min(w - 1, x2 + pw * side_extra)
-    ny1 = max(0, y1 - ph * top_extra)
-    ny2 = min(h - 1, y2)
-    return np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
-def _helmet_center_in_head_region(helmet_box, roi, head_ratio):
-    hx1, hy1, hx2, hy2 = helmet_box
-    cx = (hx1 + hx2) / 2.0; cy = (hy1 + hy2) / 2.0
-    rx1, ry1, rx2, ry2 = roi
-    if not (rx1 <= cx <= rx2 and ry1 <= cy <= ry2):
-        return False
-    head_y_limit = ry1 + (ry2 - ry1) * head_ratio
-    return cy <= head_y_limit
-
-# ---------- 클래스 매핑(4cls/7cls 자동) ----------
-def _normalize(s: str):
-    s = s.lower().strip()
-    s = re.sub(r"[_\-\s]+", " ", s)
-    s = re.sub(r"[^a-z0-9 ]", "", s)
-    return " ".join(s.split())
-
-def _find_one(norm_map, candidates):
-    cands = [_normalize(c) for c in candidates]
-    # 1) 정확 일치
-    for i, n in norm_map.items():
-        if n in cands:
-            return i
-    # 2) 부분 포함(양방향)
-    for i, n in norm_map.items():
-        if any(c in n or n in c for c in cands):
-            return i
-    return None
-
-def resolve_class_ids(model):
-    raw = model.names
-    id_to_name = {int(k): v for k, v in (raw.items() if isinstance(raw, dict) else enumerate(raw))}
-    norm_map = {i: _normalize(n) for i, n in id_to_name.items()}
-
-    CANDS = {
-        "person":    ["person"],
-        "pm":        ["pm", "personal mobility", "kickboard", "e scooter", "escooter", "electric scooter", "micromobility", "micro mobility", "e_scooter"],
-        "trash_bag": ["trash bag", "garbage bag", "plastic bag", "trash", "garbage"],
-        "helmet":    ["helmet", "hardhat", "safety helmet"],
-        "fire":      ["fire"],
-        "smoke":     ["smoke"],
-        "weapon":    ["weapon"],
-    }
-
-    ids = {}
-    for key, cands in CANDS.items():
-        idx = _find_one(norm_map, cands)
-        if idx is not None:
-            ids[key] = idx
-
-    required = ["person", "pm", "helmet"]
-    missing = [k for k in required if k not in ids]
-    if missing:
-        raise ValueError(f"[ERROR] 필수 클래스 누락: {missing} | model.names={id_to_name}")
-    return ids
-
-# ======================
-# 간단 트래커(다수결)
-# ======================
-class Track:
-    __slots__ = ("tid","bbox","last_frame","votes","prev_smoothed","last_nohelmet_log_time","rider_recent")
-    def __init__(self, tid, bbox, frame_idx, vote_window):
-        self.tid = tid
-        self.bbox = bbox.astype(np.float32)
-        self.last_frame = frame_idx
-        self.votes = deque(maxlen=vote_window)  # True/False/None
-        self.prev_smoothed = None
-        self.last_nohelmet_log_time = 0.0
-        self.rider_recent = False
-
-class SimpleHelmetTracker:
-    def __init__(self, vote_window=5, vote_min_valid=3, vote_threshold=0.5, iou_thresh=0.3, max_age_frames=30):
-        self.vote_window = int(vote_window)
-        self.vote_min_valid = int(vote_min_valid)
-        self.vote_threshold = float(vote_threshold)
-        self.iou_thresh = float(iou_thresh)
-        self.max_age_frames = int(max_age_frames)
-        self.tracks = []
-        self.next_tid = 1
-        self.frame_idx = 0
-
-    def _assign(self, dets):
-        matches = {}  # det_idx -> track
-        if not self.tracks or not dets:
-            return matches, list(range(len(dets)))
-        ious = np.zeros((len(self.tracks), len(dets)), dtype=np.float32)
-        for ti, tr in enumerate(self.tracks):
-            for di, db in enumerate(dets):
-                ious[ti, di] = iou_xyxy(tr.bbox, db)
-        pairs = [(ti, di, ious[ti, di]) for ti in range(len(self.tracks)) for di in range(len(dets)) if ious[ti, di] > self.iou_thresh]
-        pairs.sort(key=lambda x: x[2], reverse=True)
-        used_t = set(); used_d = set()
-        for ti, di, _ in pairs:
-            if ti in used_t or di in used_d:
-                continue
-            used_t.add(ti); used_d.add(di)
-            matches[di] = self.tracks[ti]
-        unmatched_dets = [di for di in range(len(dets)) if di not in used_d]
-        return matches, unmatched_dets
-
-    def update(self, person_boxes, rider_flags, inst_has_helmet_list):
-        self.frame_idx += 1
-        dets = [np.array(b, dtype=np.float32) for b in person_boxes]
-        matches, unmatched = self._assign(dets)
-
-        # update matched
-        for di, tr in matches.items():
-            tr.bbox = dets[di]
-            tr.last_frame = self.frame_idx
-            tr.rider_recent = bool(rider_flags[di])
-            tr.votes.append(bool(inst_has_helmet_list[di]) if tr.rider_recent else None)
-
-        # create tracks for unmatched
-        for di in unmatched:
-            tr = Track(self.next_tid, dets[di], self.frame_idx, self.vote_window)
-            tr.rider_recent = bool(rider_flags[di])
-            tr.votes.append(bool(inst_has_helmet_list[di]) if tr.rider_recent else None)
-            self.tracks.append(tr)
-            matches[di] = tr
-            self.next_tid += 1
-
-        # prune old
-        self.tracks = [tr for tr in self.tracks if self.frame_idx - tr.last_frame <= self.max_age_frames]
-
-        # outputs
-        det_to_out = {}
-        for di, tr in matches.items():
-            valid = [v for v in tr.votes if v is not None]
-            smoothed = None
-            if len(valid) >= self.vote_min_valid:
-                helmet_ratio = sum(1 for v in valid if v) / float(len(valid))
-                smoothed = (helmet_ratio >= self.vote_threshold)
-            was_event = False
-            if smoothed is not None and tr.prev_smoothed is not None:
-                if (tr.prev_smoothed is True) and (smoothed is False):
-                    was_event = True
-            elif smoothed is False and tr.prev_smoothed is None:
-                was_event = True
-            tr.prev_smoothed = smoothed
-            det_to_out[di] = (tr.tid, smoothed, was_event)
-        return det_to_out
-
-# ======================
-# InternVL 로더 (사용자 제공 방식)
-# ======================
-import torch
-from transformers import AutoModel, AutoTokenizer, GenerationConfig
-
-def init_model(path='OpenGVLab/InternVL3-1B', device_map: Optional[object] = "auto"):
+def _vlm_call_on_frames(
+    vlm_model, vlm_tokenizer, frames: List[np.ndarray],
+    gen_cfg_dict: dict, num_segments=8, max_num=1, fps_for_fallback=30.0
+):
     """
-    InternVL 로더 (안정성 우선):
-      - dtype: CUDA면 FP16, 아니면 FP32
-      - device_map 기본 "auto" (가장 안전)
-      - 호환성 fallback: dtype → torch_dtype, device_map={"": "cuda:0"} → None
+    InternVL 버전 차이에 안전하도록 generation_config 후보를 두 번 시도:
+      1) use_cache 미포함(dict)
+      2) use_cache=True 포함(dict)
+    각 후보에 대해 frames→video(폴백) 순서로 시도.
     """
-    use_cuda = torch.cuda.is_available()
-    prefer_dtype = torch.float16 if use_cuda else torch.float32
+    if not frames:
+        return []
 
-    kwargs = dict(
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    )
+    cfg_no_cache = {k: v for k, v in (gen_cfg_dict or {}).items() if k != "use_cache"}
+    cfg_with_cache = dict(cfg_no_cache, use_cache=True)
+    cfg_candidates = [cfg_no_cache, cfg_with_cache]
 
-    # device_map 처리
-    if device_map is None:
-        pass
-    elif device_map == "auto":
-        kwargs["device_map"] = "auto"
-    else:
-        kwargs["device_map"] = device_map  # 사용자가 직접 넘긴 맵(문자열/dict)
-
-    # 1차: 최신 Transformers는 dtype 인자를 권장
-    try:
-        model = AutoModel.from_pretrained(
-            path,
-            dtype=prefer_dtype,
-            **kwargs
-        ).eval()
-    except TypeError:
-        # 구버전 호환: torch_dtype 사용
-        model = AutoModel.from_pretrained(
-            path,
-            torch_dtype=prefer_dtype,
-            **kwargs
-        ).eval()
-    except KeyError:
-        # device_map 관련 키 이슈 → 재시도
+    def _try_frames(cfg):
         try:
-            km = kwargs.copy()
-            km["device_map"] = {"": "cuda:0"} if use_cuda else None
-            model = AutoModel.from_pretrained(
-                path,
-                dtype=prefer_dtype,
-                **km
-            ).eval()
-        except Exception:
-            # 최후 수단: device_map 해제 후 로드 → 이후 to(cuda)
-            model = AutoModel.from_pretrained(
-                path,
-                dtype=prefer_dtype,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True
-            ).eval()
-            if use_cuda:
-                model = model.to("cuda")
-
-    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
-    return model, tokenizer
-
-# ======================
-# InternVL3-1B 캡셔너 (init_model 사용 + generation_config + 타입 호환 보강)
-# ======================
-class InternVLCaptioner:
-    """
-    1) 제공된 init_model()로 InternVL3-1B 로드 (device_map='auto' 기본)
-    2) 실패 시 transformers.pipeline('image-to-text') 폴백
-    - InternVL 경로: 입력은 **RGB numpy.ndarray**로 전달 ('.shape' 필요 버전 호환)
-    - generation_config를 기본 제공, 구버전 시그니처 자동 폴백
-    """
-    def __init__(self, model_name, device_map="auto", max_new_tokens=64, lang="ko"):
-        self.model_name = model_name
-        self.device_map = device_map   # "auto" | None | dict/str
-        self.max_new_tokens = int(max_new_tokens)
-        self.lang = lang
-        self.avail = False
-        self.backend = None  # "internvl" | "pipeline"
-        self.model = None
-        self.tokenizer = None
-        self.pipeline = None
-        self.gen_cfg = None  # GenerationConfig (internvl 경로에서 사용)
-
-    def load(self):
-        # 우선: 사용자 init_model()로 로드
-        try:
-            self.model, self.tokenizer = init_model(self.model_name, device_map=self.device_map)
-            self.gen_cfg = GenerationConfig(
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                temperature=0.0,
-                top_p=1.0,
-                num_beams=1,
-                repetition_penalty=1.05,
+            return run_frames_inference(
+                model=vlm_model,
+                tokenizer=vlm_tokenizer,
+                frames=frames,
+                generation_config=cfg,     # InternVL chat 4번째 위치 인자와 호환
+                num_segments=num_segments,
+                max_num=max_num
             )
-            self.backend = "internvl"
-            self.avail = True
-            print(f"[VLM] Loaded InternVL via init_model: {self.model_name} (device_map={self.device_map})")
-            return self
-        except Exception as e1:
-            print(f"[VLM] init_model load failed: {e1}")
-
-        # 폴백: image-to-text 파이프라인
-        try:
-            from transformers import pipeline
-            self.pipeline = pipeline(task="image-to-text", model=self.model_name)
-            self.backend = "pipeline"
-            self.avail = True
-            print(f"[VLM] Fallback pipeline(image-to-text) loaded: {self.model_name}")
-            return self
-        except Exception as e2:
-            print(f"[VLM] Fallback pipeline load failed: {e2}")
-            self.avail = False
-            return self
-
-    @staticmethod
-    def _bgr_to_rgb_np(img_bgr):
-        # InternVL 일부 버전은 PIL이 아니라 numpy RGB를 기대(.shape 사용)
-        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-    def _to_pil(self, img_bgr):
-        # 파이프라인 경로에선 PIL을 선호
-        from PIL import Image
-        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb)
-
-    def caption(self, img_bgr, prompt=None):
-        if not self.avail:
-            return None
-        if prompt is None:
-            prompt = ("이 이미지를 간단하고 핵심적으로 한국어로 설명해줘."
-                      if self.lang == "ko"
-                      else "Describe this image briefly and concisely in English.")
-        try:
-            if self.backend == "internvl":
-                rgb_np = self._bgr_to_rgb_np(img_bgr)  # numpy 배열
-                # 1) 최신 시그니처: generation_config 필요
-                try:
-                    text = self.model.chat(
-                        self.tokenizer, rgb_np, prompt,
-                        history=[], generation_config=self.gen_cfg
-                    )
-                except TypeError:
-                    # 2) 구버전 시그니처: generation_config 없이
-                    text = self.model.chat(self.tokenizer, rgb_np, prompt, history=[])
-                if isinstance(text, (list, tuple)):
-                    text = text[-1] if text else ""
-                return str(text)
-            else:
-                # pipeline 경로도 PIL 입력 사용
-                pil = self._to_pil(img_bgr)
-                out = self.pipeline(pil, max_new_tokens=self.max_new_tokens)
-                if isinstance(out, list) and out:
-                    return str(out[0].get("generated_text") or out[0].get("caption") or out[0])
-                return str(out)
         except Exception as e:
-            print(f"[VLM] caption failed: {e}")
+            print(f"[VLM] frames inference failed ({'use_cache' in cfg}): {e}")
             return None
+
+    def _try_video(cfg):
+        try:
+            tmp = _write_frames_to_temp_video(frames, fps_for_fallback)
+            try:
+                return run_video_inference(
+                    model=vlm_model,
+                    tokenizer=vlm_tokenizer,
+                    video_path=tmp,
+                    generation_config=cfg,
+                    num_segments=num_segments,
+                    max_num=max_num
+                )
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[VLM] video inference failed ({'use_cache' in cfg}): {e}")
+            return None
+
+    for cfg in cfg_candidates:
+        qa = _try_frames(cfg)
+        if qa:
+            return qa
+
+    for cfg in cfg_candidates:
+        qa = _try_video(cfg)
+        if qa:
+            return qa
+
+    print("[VLM] caption failed: all attempts exhausted")
+    return []
 
 # ======================
 # 비디오 추론 앱
@@ -462,9 +223,7 @@ class VideoPMHelmetApp:
 
         # VLM 설정
         self.vlm_enable = bool(args.vlm_enable)
-        self.vlm_model  = args.vlm_model
-        # device_map 파싱: "auto" | "None" | JSON 문자열(딕셔너리)
-        self.vlm_device_map = None
+        self.vlm_model_name  = args.vlm_model
         if args.vlm_device_map == "auto":
             self.vlm_device_map = "auto"
         elif args.vlm_device_map == "None":
@@ -473,20 +232,24 @@ class VideoPMHelmetApp:
             try:
                 self.vlm_device_map = json.loads(args.vlm_device_map)
             except Exception:
-                # 문자열 그대로 전달
                 self.vlm_device_map = args.vlm_device_map
-
         self.vlm_maxtok = args.vlm_max_new_tokens
         self.vlm_cond   = args.vlm_condition.lower().strip()
         self.vlm_lang   = args.vlm_lang
-        self.vlm_save_annotated = bool(args.vlm_save_annotated)
-        self.vlm_min_interval   = float(args.vlm_min_interval)
+        self.vlm_save_img = bool(args.vlm_save_annotated)  # 로그 이미지 저장 주석 유무
+        self.vlm_min_interval = float(args.vlm_min_interval)
+        self.vlm_clip_sec = float(args.vlm_clip_sec)
+        self.vlm_segments = int(args.vlm_segments)
+        self.vlm_max_num  = int(args.vlm_max_num)
+        self.vlm_input_annotated = bool(args.vlm_input_annotated)  # ★ VLM 입력 프레임 소스 토글
+
         self.vlm_images_dir = self.out_dir / "vlm_images"
         self.vlm_images_dir.mkdir(parents=True, exist_ok=True)
-        self.vlm_jsonl_path = self.log_dir / "vlm_captions.jsonl"
-        self._last_caption_t = -1e9  # 비디오 상대시각 기준
+        self.vlm_jsonl_path = self.log_dir / "vlm_qa.jsonl"
+        self._last_caption_t = -1e9
+        self._video_stamp_meta = _video_stamp_meta
 
-        # 모델
+        # YOLO 모델
         print(f"[INFO] Loading YOLO weights: {self.weights}")
         self.model = YOLO(self.weights)
         if self.device:
@@ -514,148 +277,48 @@ class VideoPMHelmetApp:
             "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0
         }
 
-        # VLM 로더
-        self.captioner = None
+        # VLM 로더 (InternVL Only)
+        self.vlm_model = None
+        self.vlm_tokenizer = None
+        self.gen_cfg_dict = dict(
+            max_new_tokens=int(self.vlm_maxtok),
+            do_sample=False,
+            top_p=1.0,
+            num_beams=1,
+            repetition_penalty=1.05,
+        )
         if self.vlm_enable:
-            self.captioner = InternVLCaptioner(
-                model_name=self.vlm_model,
-                device_map=self.vlm_device_map,
-                max_new_tokens=self.vlm_maxtok,
-                lang=self.vlm_lang
-            ).load()
-            if not self.captioner.avail:
-                print("[VLM] Captioner unavailable. Proceeding without captions.")
+            try:
+                self.vlm_model, self.vlm_tokenizer = vlm_init_model(self.vlm_model_name, device_map=self.vlm_device_map)
+                print(f"[VLM] Loaded via video_vlm.init_model: {self.vlm_model_name} (device_map={self.vlm_device_map})")
+            except Exception as e:
+                print(f"[VLM] load failed: {e}")
+                self.vlm_enable = False
 
-    # ---------- 로그 유틸 ----------
-    def _append_csv(self, file_path: Path, header: list, row: list):
-        existed = file_path.exists()
-        with open(file_path, "a", newline="") as f:
-            w = csv.writer(f)
-            if not existed:
-                w.writerow(header)
-            w.writerow(row)
-
-    def _video_stamp_meta(self, base_unix: float, frame_idx: int, fps: float):
-        t = (frame_idx / (fps if fps > 1e-6 else 30.0))
-        ts_unix = base_unix + t
-        sec = int(ts_unix)
-        nsec = int((ts_unix - sec) * 1e9)
-        iso = datetime.fromtimestamp(ts_unix).isoformat()
-        return {"sec": sec, "nsec": nsec, "iso": iso, "t": t}
-
-    def log_no_helmet(self, stamp_meta, track_id, bbox, persons, vote_window, valid_votes, threshold, helmet_ratio):
-        fp = self.log_dir / "no_helmet.csv"
-        header = ["stamp_sec","stamp_nsec","iso","track_id","bbox_x1","bbox_y1","bbox_x2","bbox_y2",
-                  "persons","vote_window","valid_votes","vote_threshold","helmet_ratio"]
-        row = [stamp_meta["sec"], stamp_meta["nsec"], stamp_meta["iso"], track_id,
-               int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
-               persons, vote_window, valid_votes, threshold, round(helmet_ratio,3)]
-        self._append_csv(fp, header, row)
-
-    def log_hazard(self, stamp_meta, event_type, count, persons):
-        fp = self.log_dir / f"hazard_{event_type}.csv"
-        header = ["stamp_sec","stamp_nsec","iso","event","count","persons"]
-        row = [stamp_meta["sec"], stamp_meta["nsec"], stamp_meta["iso"], event_type, count, persons]
-        self._append_csv(fp, header, row)
-
-    # ----- 도메인 특화 프롬프트 빌더 -----
-    def _make_domain_prompt(self, event_type: str, total_persons: int, stats: dict, det_to_track: dict) -> str:
-        """
-        YOLO 탐지값을 힌트로 제공하면서, 안전/치안 요소를 한 줄 요약하도록 유도.
-        """
-        rider_flags = stats.get("rider_flags", [])
-        inst_has_helmet = stats.get("inst_has_helmet", [])
-        # 스무딩 결과 우선 사용, 없으면 inst_has_helmet 사용
-        helmet_on = helmet_off = helmet_unknown = 0
-        for idx, is_rider in enumerate(rider_flags):
-            if not is_rider:
-                continue
-            smoothed = det_to_track.get(idx, (None, None, False))[1]
-            if smoothed is True:
-                helmet_on += 1
-            elif smoothed is False:
-                helmet_off += 1
-            else:
-                # 즉시판정 참고
-                if inst_has_helmet[idx]:
-                    helmet_on += 1
-                else:
-                    helmet_unknown += 1
-        riders = sum(1 for f in rider_flags if f)
-        crowd = (total_persons >= self.crowd_person_threshold)
-
-        # 힌트 집계
-        hint = {
-            "persons": total_persons,
-            "riders": riders,
-            "helmet_on": helmet_on,
-            "helmet_off": helmet_off,
-            "helmet_unknown": helmet_unknown,
-            "crowd_6plus": "예" if crowd else "아니오",
-            "trash_bag": stats.get("trash_count", 0),
-            "fire": stats.get("fire_count", 0),
-            "smoke": stats.get("smoke_count", 0),
-            "weapon": stats.get("weapon_count", 0),
-            "event": event_type,
-        }
-
-        if self.vlm_lang == "ko":
-            prompt = (
-                "아래 힌트를 참고해 보이는 사실만 근거로 안전 점검 요약을 한국어 한 문장으로 작성하세요. "
-                "정확하고 간결하게, 과장/추측 금지.\n"
-                f"힌트: 사람={hint['persons']}, 라이더={hint['riders']}, 헬멧착용={hint['helmet_on']}명, "
-                f"무헬멧={hint['helmet_off']}명, 불명={hint['helmet_unknown']}명, "
-                f"군집(6+명)={hint['crowd_6plus']}, 쓰레기봉투={hint['trash_bag']}, "
-                f"화재={hint['fire']}, 연기={hint['smoke']}, 흉기={hint['weapon']}, 이벤트={hint['event']}.\n"
-                "출력 형식 예: '사람≈N, 라이더 M명(헬멧 O/X/혼재), 군집 O/X, 쓰봉 O/X, 화재 O/X, 연기 O/X, 흉기 O/X, 메모: …'"
-            )
-        else:
-            prompt = (
-                "Using the hints below, write a concise, factual one‑sentence safety summary in English. "
-                "No speculation; be precise.\n"
-                f"Hints: persons={hint['persons']}, riders={hint['riders']}, helmet_on={hint['helmet_on']}, "
-                f"helmet_off={hint['helmet_off']}, unknown={hint['helmet_unknown']}, "
-                f"crowd_6plus={hint['crowd_6plus']}, trash_bag={hint['trash_bag']}, "
-                f"fire={hint['fire']}, smoke={hint['smoke']}, weapon={hint['weapon']}, event={hint['event']}.\n"
-                "Output format example: 'people≈N, riders M (helmet on/off/mixed), crowd Y/N, trash Y/N, fire Y/N, smoke Y/N, weapon Y/N, note: …'"
-            )
-        return prompt
-
-    def _save_image_and_caption(self, img_bgr, vis_bgr, stamp_meta, frame_idx, event_type, info_dict, prompt=None):
-        """이미지 저장 + 캡션 생성 + JSONL 기록"""
-        if not (self.captioner and self.captioner.avail):
-            return
-
-        # any 모드에서 과도한 캡션 방지
-        if self.vlm_cond == "any":
-            if (stamp_meta["t"] - self._last_caption_t) < self.vlm_min_interval:
-                return
-
-        img_to_log = vis_bgr if self.vlm_save_annotated else img_bgr
-        stem = f"{Path(self.source).stem}_f{frame_idx:06d}_{event_type}"
+    def _save_img_for_vlm(self, img_bgr, vis_bgr, stem):
         img_path = self.vlm_images_dir / f"{stem}.jpg"
         try:
-            cv2.imwrite(str(img_path), img_to_log)
-        except Exception as e:
-            print(f"[VLM] image save failed: {e}")
-            return
+            # 로그 저장 이미지는 --vlm_save_annotated 토글로 결정
+            cv2.imwrite(str(img_path), vis_bgr if self.vlm_save_img else img_bgr)
+            return str(img_path)
+        except Exception:
+            return ""
 
-        caption = self.captioner.caption(img_to_log, prompt=prompt)
+    def _log_vlm_qa(self, stamp_meta, frame_idx, event_type, qa_list, extra=None, image_path=""):
         rec = {
             "stamp_iso": stamp_meta["iso"],
             "frame_idx": frame_idx,
             "event": event_type,
-            "image_path": str(img_path),
-            "caption": caption,
+            "image_path": image_path,
+            "qa": qa_list,
         }
-        rec.update(info_dict or {})
-
+        if extra:
+            rec.update(extra)
         try:
             with open(self.vlm_jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
             print(f"[VLM] jsonl append failed: {e}")
-        self._last_caption_t = stamp_meta["t"]
 
     # ---------- 프레임 추론 ----------
     def run_inference(self, frame):
@@ -725,7 +388,7 @@ class VideoPMHelmetApp:
 
         total_persons = len(person_boxes)
 
-        # 시각화 — Rider(트랙ID + 스무딩 결과)
+        # 시각화 — Rider
         for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
             if not is_rider:
                 continue
@@ -739,7 +402,7 @@ class VideoPMHelmetApp:
             cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_RIDER, 2)
             draw_label(vis, x1, y1, label, COLOR_RIDER)
 
-        # 시각화 — 일반 Person (사람 수가 임계 이상일 때만)
+        # 시각화 — 일반 Person (임계 이상)
         if total_persons >= self.person_draw_min_count:
             for (pb, is_rider) in zip(person_boxes, rider_flags):
                 if is_rider:
@@ -747,7 +410,6 @@ class VideoPMHelmetApp:
                 x1, y1, x2, y2 = pb.astype(int)
                 cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_PERSON, 2)
                 draw_label(vis, x1, y1, "Person", COLOR_PERSON)
-
             text = f"Persons: {total_persons}"
             (tw, th), _ = cv2.getTextSize(text, FONT, 0.8, 2)
             x0 = w - tw - 16; y0 = 16 + th + 8
@@ -785,7 +447,7 @@ class VideoPMHelmetApp:
             "pm_count": len(pm_boxes),
             "helmet_count": len(helmet_boxes),
         }
-        return vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats, frame  # raw frame 포함
+        return vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats, frame
 
     # ---------- 메인 루프 ----------
     def run(self):
@@ -809,7 +471,12 @@ class VideoPMHelmetApp:
         if not writer.isOpened():
             raise RuntimeError(f"Cannot open writer: {out_path}")
 
-        base_unix = time.time()  # 로그용 기준시각
+        # 최근 프레임 버퍼 (이벤트용) — 원본/주석 분리
+        clip_len_frames = max(1, int(self.vlm_clip_sec * fps))
+        recent_raw_frames = deque(maxlen=clip_len_frames)
+        recent_vis_frames = deque(maxlen=clip_len_frames)
+
+        base_unix = time.time()
         frame_idx = 0
 
         try:
@@ -819,12 +486,18 @@ class VideoPMHelmetApp:
                     break
                 frame_idx += 1
 
+                # 원본 프레임 버퍼에 먼저 저장
+                recent_raw_frames.append(frame.copy())
+
+                # 추론 + 주석 프레임 생성
                 vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats, raw_frame = self.run_inference(frame)
 
-                # ===== 로깅/캡션 =====
-                stamp_meta = self._video_stamp_meta(base_unix, frame_idx, fps)
-                now_t = stamp_meta["t"]  # 비디오 상대시각
+                # 주석 프레임 버퍼에도 저장
+                recent_vis_frames.append(vis.copy())
 
+                # ===== 로깅/QA =====
+                stamp_meta = self._video_stamp_meta(base_unix, frame_idx, fps)
+                now_t = stamp_meta["t"]
                 any_detection = (
                     total_persons > 0 or
                     stats["pm_count"] > 0 or
@@ -835,9 +508,10 @@ class VideoPMHelmetApp:
                     stats["weapon_count"] > 0
                 )
 
-                # (A) 무헬멧(다수결) — 상태 전이 시 로깅(트랙별 쿨다운) + 캡션
                 det_to_track = stats["det_to_track"]
                 rider_flags = stats["rider_flags"]
+
+                # (A) 무헬멧 전이 이벤트
                 for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
                     if not is_rider:
                         continue
@@ -852,20 +526,34 @@ class VideoPMHelmetApp:
                         if (now_t - tr.last_nohelmet_log_time) >= self.nohelmet_cooldown:
                             valid = [v for v in tr.votes if v is not None]
                             ratio = (sum(1 for v in valid if v)/len(valid)) if len(valid) > 0 else 0.0
-                            self.log_no_helmet(stamp_meta, tid, pb, total_persons,
-                                               self.tracker.vote_window, len(valid),
-                                               self.tracker.vote_threshold, ratio)
+
+                            # CSV 로그
+                            log_no_helmet(
+                                log_dir=self.log_dir,
+                                stamp_meta=stamp_meta,
+                                track_id=int(tid),
+                                bbox=pb,  # [x1,y1,x2,y2]
+                                persons=int(total_persons),
+                                vote_window=int(self.tracker.vote_window),
+                                valid_votes=int(len(valid)),
+                                threshold=float(self.tracker.vote_threshold),
+                                helmet_ratio=float(ratio),
+                            )
                             tr.last_nohelmet_log_time = now_t
 
-                            # VLM 캡션 — 도메인 특화 프롬프트
+                            # VLM QA (event 모드 또는 any+검출)
                             if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
-                                domain_prompt = self._make_domain_prompt(
-                                    event_type="no_helmet",
-                                    total_persons=total_persons,
-                                    stats=stats,
-                                    det_to_track=det_to_track
+                                frames_for_vlm = list(recent_vis_frames) if self.vlm_input_annotated else list(recent_raw_frames)
+                                qa = _vlm_call_on_frames(
+                                    self.vlm_model, self.vlm_tokenizer,
+                                    frames_for_vlm, self.gen_cfg_dict,
+                                    num_segments=self.vlm_segments,
+                                    max_num=self.vlm_max_num,
+                                    fps_for_fallback=fps
                                 )
-                                info_dict = {
+                                stem = f"{src.stem}_f{frame_idx:06d}_nohelmet"
+                                img_path = self._save_img_for_vlm(raw_frame, vis, stem) if self.vlm_save_img else ""
+                                extra = {
                                     "persons": total_persons,
                                     "pm": stats["pm_count"],
                                     "helmet": stats["helmet_count"],
@@ -876,13 +564,9 @@ class VideoPMHelmetApp:
                                     "track_id": int(tid),
                                     "event_detail": "no_helmet_transition"
                                 }
-                                self._save_image_and_caption(
-                                    img_bgr=raw_frame, vis_bgr=vis, stamp_meta=stamp_meta,
-                                    frame_idx=frame_idx, event_type="no_helmet", info_dict=info_dict,
-                                    prompt=domain_prompt
-                                )
+                                self._log_vlm_qa(stamp_meta, frame_idx, "no_helmet", qa, extra, img_path)
 
-                # (B) 군집 + Hazard 로깅(쿨다운) + 캡션
+                # (B) 군집 + Hazard
                 is_crowd = (total_persons >= self.crowd_person_threshold)
                 if is_crowd:
                     hazards = [
@@ -896,18 +580,28 @@ class VideoPMHelmetApp:
                             continue
                         last_t = self.last_hazard_log_time.get(name, 0.0)
                         if (now_t - last_t) >= self.log_cooldown:
-                            self.log_hazard(stamp_meta, name, cnt, total_persons)
+                            # CSV 로그
+                            log_hazard(
+                                log_dir=self.log_dir,
+                                stamp_meta=stamp_meta,
+                                event_type=name,
+                                count=int(cnt),
+                                persons=int(total_persons),
+                            )
                             self.last_hazard_log_time[name] = now_t
 
-                            # VLM 캡션 — 도메인 특화 프롬프트
                             if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
-                                domain_prompt = self._make_domain_prompt(
-                                    event_type=f"hazard_{name}",
-                                    total_persons=total_persons,
-                                    stats=stats,
-                                    det_to_track=det_to_track
+                                frames_for_vlm = list(recent_vis_frames) if self.vlm_input_annotated else list(recent_raw_frames)
+                                qa = _vlm_call_on_frames(
+                                    self.vlm_model, self.vlm_tokenizer,
+                                    frames_for_vlm, self.gen_cfg_dict,
+                                    num_segments=self.vlm_segments,
+                                    max_num=self.vlm_max_num,
+                                    fps_for_fallback=fps
                                 )
-                                info_dict = {
+                                stem = f"{src.stem}_f{frame_idx:06d}_{name}"
+                                img_path = self._save_img_for_vlm(raw_frame, vis, stem) if self.vlm_save_img else ""
+                                extra = {
                                     "persons": total_persons,
                                     "pm": stats["pm_count"],
                                     "helmet": stats["helmet_count"],
@@ -917,41 +611,38 @@ class VideoPMHelmetApp:
                                     "weapon": stats["weapon_count"],
                                     "event_detail": f"hazard_{name}"
                                 }
-                                self._save_image_and_caption(
-                                    img_bgr=raw_frame, vis_bgr=vis, stamp_meta=stamp_meta,
-                                    frame_idx=frame_idx, event_type=name, info_dict=info_dict,
-                                    prompt=domain_prompt
-                                )
+                                self._log_vlm_qa(stamp_meta, frame_idx, name, qa, extra, img_path)
 
-                # (옵션) any 모드: 검출이 있는 모든 프레임 캡션(최소 간격 적용)
+                # (옵션) any 모드: 검출이 있는 모든 시점, 최소 간격 보장
                 if self.vlm_enable and self.vlm_cond == "any" and any_detection:
-                    domain_prompt = self._make_domain_prompt(
-                        event_type="any_detection",
-                        total_persons=total_persons,
-                        stats=stats,
-                        det_to_track=det_to_track
-                    )
-                    info_dict = {
-                        "persons": total_persons,
-                        "pm": stats["pm_count"],
-                        "helmet": stats["helmet_count"],
-                        "trash_bag": stats["trash_count"],
-                        "fire": stats["fire_count"],
-                        "smoke": stats["smoke_count"],
-                        "weapon": stats["weapon_count"],
-                        "event_detail": "any_detection"
-                    }
-                    self._save_image_and_caption(
-                        img_bgr=raw_frame, vis_bgr=vis, stamp_meta=stamp_meta,
-                        frame_idx=frame_idx, event_type="any", info_dict=info_dict,
-                        prompt=domain_prompt
-                    )
+                    if (stamp_meta["t"] - self._last_caption_t) >= self.vlm_min_interval:
+                        frames_for_vlm = list(recent_vis_frames) if self.vlm_input_annotated else list(recent_raw_frames)
+                        qa = _vlm_call_on_frames(
+                            self.vlm_model, self.vlm_tokenizer,
+                            frames_for_vlm, self.gen_cfg_dict,
+                            num_segments=self.vlm_segments,
+                            max_num=self.vlm_max_num,
+                            fps_for_fallback=fps
+                        )
+                        stem = f"{src.stem}_f{frame_idx:06d}_any"
+                        img_path = self._save_img_for_vlm(raw_frame, vis, stem) if self.vlm_save_img else ""
+                        extra = {
+                            "persons": total_persons,
+                            "pm": stats["pm_count"],
+                            "helmet": stats["helmet_count"],
+                            "trash_bag": stats["trash_count"],
+                            "fire": stats["fire_count"],
+                            "smoke": stats["smoke_count"],
+                            "weapon": stats["weapon_count"],
+                            "event_detail": "any_detection"
+                        }
+                        self._log_vlm_qa(stamp_meta, frame_idx, "any", qa, extra, img_path)
+                        self._last_caption_t = stamp_meta["t"]
 
                 # ===== 출력 =====
                 writer.write(vis)
                 if self.preview:
                     cv2.imshow("PM/Rider/Helmet (Video)", vis)
-                    # ESC or q
                     k = cv2.waitKey(1) & 0xFF
                     if k in (27, ord('q')):
                         print("[INFO] Interrupted by user.")
@@ -969,17 +660,19 @@ class VideoPMHelmetApp:
             print(f"[INFO] Logs dir: {self.log_dir.resolve()}")
             if self.vlm_enable:
                 print(f"[INFO] VLM images dir: {self.vlm_images_dir.resolve()}")
-                print(f"[INFO] VLM captions jsonl: {self.vlm_jsonl_path.resolve()}")
+                print(f"[INFO] VLM QA jsonl: {self.vlm_jsonl_path.resolve()}")
 
 # ======================
 # CLI
 # ======================
 def parse_args():
-    p = argparse.ArgumentParser(description="Local Video → YOLO one-pass w/ majority voting, event logs, InternVL captions")
+    p = argparse.ArgumentParser(
+        description="Local Video → YOLO one-pass w/ majority voting, event logs, InternVL QA (frames→video fallback)"
+    )
     p.add_argument("--source", type=str, default=DEFAULT_SOURCE, help="input video path")
     p.add_argument("--weights", type=str, default=DEFAULT_WEIGHTS, help=".pt path (4 or 7 classes)")
     p.add_argument("--out_dir", type=str, default=DEFAULT_OUT_DIR, help="output directory")
-    p.add_argument("--out_suffix", type=str, default=DEFAULT_OUT_SUFFIX, help="output filename suffix (appended to stem)")
+    p.add_argument("--out_suffix", type=str, default=DEFAULT_OUT_SUFFIX, help="output filename suffix")
 
     p.add_argument("--conf_thres", type=float, default=DEFAULT_CONF_THRES)
     p.add_argument("--iou_thres",  type=float, default=DEFAULT_IOU_THRES)
@@ -1005,15 +698,23 @@ def parse_args():
     p.add_argument("--preview", type=int, default=int(DEFAULT_PREVIEW), help="1 to show preview window")
 
     # VLM 옵션
-    p.add_argument("--vlm_enable", type=int, default=int(DEFAULT_VLM_ENABLE), help="1 to enable InternVL captioning")
+    p.add_argument("--vlm_enable", type=int, default=int(DEFAULT_VLM_ENABLE), help="1 to enable InternVL QA")
     p.add_argument("--vlm_model", type=str, default=DEFAULT_VLM_MODEL, help="e.g., OpenGVLab/InternVL3-1B")
     p.add_argument("--vlm_device_map", type=str, default=DEFAULT_VLM_DEVICE_MAP,
-                   help="device map for InternVL loader: 'auto' | 'None' | JSON string (e.g., '{\"\": \"cuda:0\"}')")
+                   help="device map: 'auto' | 'None' | JSON string (e.g., '{\"\": \"cuda:0\"}')")
     p.add_argument("--vlm_max_new_tokens", type=int, default=DEFAULT_VLM_MAXTOK)
     p.add_argument("--vlm_condition", type=str, default=DEFAULT_VLM_COND, help="event|any")
     p.add_argument("--vlm_lang", type=str, default=DEFAULT_VLM_LANG, help="ko|en")
-    p.add_argument("--vlm_save_annotated", type=int, default=int(DEFAULT_VLM_SAVE_ANN), help="1: save annotated frame (vis), 0: save raw frame")
-    p.add_argument("--vlm_min_interval", type=float, default=DEFAULT_VLM_MIN_INTERVAL, help="min seconds between captions in 'any' mode")
+    p.add_argument("--vlm_save_annotated", type=int, default=int(DEFAULT_VLM_SAVE_IMG), help="1: save annotated image for QA log")
+    p.add_argument("--vlm_min_interval", type=float, default=DEFAULT_VLM_MIN_INTERVAL, help="min seconds between QA in 'any' mode")
+
+    # 새 옵션: 이벤트 클립 길이/샘플링 및 입력 소스
+    p.add_argument("--vlm_clip_sec", type=float, default=DEFAULT_VLM_CLIP_SEC, help="seconds of recent frames to feed to VLM per event")
+    p.add_argument("--vlm_segments", type=int, default=DEFAULT_VLM_SEGMENTS, help="run_frames_inference num_segments")
+    p.add_argument("--vlm_max_num", type=int, default=DEFAULT_VLM_MAX_NUM, help="video_vlm tiling 'max_num'")
+    p.add_argument("--vlm_input_annotated", type=int, default=DEFAULT_VLM_INPUT_ANNOTATED,
+                   help="1: feed annotated frames (with boxes) to VLM; 0: feed raw frames")
+
     return p.parse_args()
 
 def main():
