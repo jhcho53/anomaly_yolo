@@ -36,6 +36,7 @@ from datetime import datetime
 from typing import List, Tuple, Optional
 
 import rclpy
+import torch
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy
 
@@ -112,6 +113,88 @@ COLOR_FIRE    = (0, 0, 255)
 COLOR_SMOKE   = (160, 160, 160)
 COLOR_WEAPON  = (180, 0, 180)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+def _install_torchvision_nms_fallback(force: bool = False) -> bool:
+    """
+    torchvision의 C++ NMS 대신, 순수 PyTorch NMS로 모키 패치.
+    반환: True(폴백 적용) / False(원본 사용)
+    """
+    try:
+        import torchvision
+    except Exception as e:
+        print(f"[WARN] torchvision import failed: {e} -> using pure PyTorch NMS fallback")
+        torchvision = None
+
+    # 순수 PyTorch IoU (벡터화)
+    def _box_iou(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # a: [M,4], b: [N,4] with (x1,y1,x2,y2)
+        a = a.float()
+        b = b.float()
+        tl = torch.max(a[:, None, :2], b[None, :, :2])       # [M,N,2]
+        br = torch.min(a[:, None, 2:], b[None, :, 2:])       # [M,N,2]
+        wh = (br - tl).clamp(min=0)
+        inter = wh[..., 0] * wh[..., 1]                      # [M,N]
+        area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])   # [M]
+        area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])   # [N]
+        union = area_a[:, None] + area_b[None, :] - inter + 1e-7
+        return inter / union
+
+    def _nms_fallback(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> torch.Tensor:
+        """
+        boxes: [N,4], scores: [N]
+        return: keep indices (LongTensor)
+        """
+        if boxes.numel() == 0:
+            return boxes.new_zeros((0,), dtype=torch.long)
+
+        device = boxes.device
+        boxes = boxes.to(dtype=torch.float32)
+        scores = scores.to(dtype=torch.float32)
+
+        order = torch.argsort(scores, descending=True)
+        keep = []
+
+        while order.numel() > 0:
+            i = order[0]
+            keep.append(i)
+            if order.numel() == 1:
+                break
+            ious = _box_iou(boxes[i].unsqueeze(0), boxes[order[1:]])[0]  # [N-1]
+            remain = (ious <= float(iou_thres)).nonzero(as_tuple=False).squeeze(1)
+            order = order[1:][remain]
+
+        return torch.tensor(keep, dtype=torch.long, device=device)
+
+    # 모키 패치 조건 판단
+    patched = False
+    if force:
+        try:
+            import torchvision
+            torchvision.ops.nms = _nms_fallback
+            patched = True
+        except Exception:
+            patched = True  # torchvision 없어도 어차피 원본 못씀
+    else:
+        try:
+            import torchvision
+            # 원본 NMS가 작동하는지 가볍게 점검
+            try:
+                _ = torchvision.ops.nms(torch.zeros((1, 4)), torch.zeros((1,)), 0.5)
+                patched = False  # 정상 동작 → 패치 불필요
+            except Exception:
+                torchvision.ops.nms = _nms_fallback
+                patched = True
+        except Exception:
+            patched = True  # torchvision import 자체가 문제 → 폴백만 사용 가능
+
+    if patched:
+        print("[WARN] Using pure-PyTorch NMS fallback (torchvision C++ ops unavailable).")
+    else:
+        print("[INFO] Using torchvision built-in NMS (C++ ops).")
+    return patched
+
+# 실제 적용 (YOLO 사용 전에 호출)
+_install_torchvision_nms_fallback()
 
 # ======================
 # 유틸 함수
