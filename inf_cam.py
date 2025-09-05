@@ -2,26 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 inf_cam.py — ROS2 Humble real-time YOLO one-pass inference + majority-vote stabilization + event logging + InternVL-only QA
+with multi-camera support.
 
 Overview
-- Automatically supports 4-class or 7-class weights (.pt)
+- Auto-support 4-class or 7-class (.pt)
   * 4cls: person, pm, trash bag, helmet
   * 7cls: person, pm, trash bag, helmet, fire, smoke, weapon
-- Rider detection: expand a PM box by 2×; if IoU > 0.01 with a person → Rider
-- Helmet detection (riders only): if a helmet box center falls within the upper 60% of the head ROI
-  (ROI = top 20%, left/right ±5%) → Helmet
-- Majority-vote smoothing: smooth helmet state across recent frames (vote_window) using vote_threshold
-- CSV logging:
-  * no_helmet.csv: when a rider transitions Helmet→NoHelmet (per-track cooldown)
-  * hazard_*.csv: when #people ≥ crowd_person_threshold (default 6) and trash_bag/fire/smoke/weapon is detected (cooldown)
+- Rider: expand PM box ×2; IoU > 0.01 with a person → Rider
+- Helmet (riders only): helmet box center ∈ top 60% of head ROI (ROI = top 20%, ±5% sides)
+- Majority vote smoothing across recent frames
+- CSV logs:
+  * no_helmet.csv on Helmet→NoHelmet transition (per-track cooldown)
+  * hazard_*.csv when #people ≥ crowd_person_threshold and hazard present (cooldown)
 
-InternVL (Only) QA
-- VLM load: utils.video_vlm.init_model (safe loading, e.g., device_map="auto")
-- On event, extract the most recent N seconds (vlm_clip_sec) of frames and run single-turn QA
-  (one-sentence summary guided by detection context)
-  - Prefer run_frames_inference; fallback to temporary MP4 + run_video_inference on failure
-- JSONL logging: logs/vlm_qa.jsonl
-- Option: save caption images (logs/vlm_images/)
+VLM (InternVL only)
+- Load via utils.video_vlm.init_model (safe, e.g., device_map="auto")
+- On event, take recent N seconds (vlm_clip_sec) and run single-turn QA
+  - Prefer run_frames_inference; fallback to temp MP4 + run_video_inference
+- JSONL: logs/vlm_qa.jsonl
+- Optional caption image saving (logs/vlm_images/)
+
+Multi-camera
+- Parameters:
+  * camera_count (int, default 1)
+  * input_topic_tmpl (e.g., "/camera{idx}/image_raw")
+  * output_topic_tmpl (e.g., "/pm_helmet/image_annotated_{idx}")
+- For camera_count==1, the legacy parameters `input_topic`/`output_topic` are respected.
+- Each camera has its own tracker, recent buffer, cooldown timers, publisher, and processing flag.
 """
 
 import os
@@ -30,10 +37,11 @@ import cv2
 import json
 import tempfile
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Deque, Dict, Tuple
 
 import rclpy
 import torch
@@ -63,8 +71,15 @@ from model.track import SimpleHelmetTracker
 # Defaults (constants)
 # ======================
 DEFAULT_WEIGHTS = "Pretrained/4_class.pt"
+
+# Legacy single-camera topics
 DEFAULT_INPUT_TOPIC = "/camera/image_raw"           # or .../compressed
 DEFAULT_OUTPUT_TOPIC = "/pm_helmet/image_annotated"
+
+# multi-camera
+DEFAULT_CAMERA_COUNT = 1
+DEFAULT_INPUT_TMPL = "/camera{idx}/image_raw"
+DEFAULT_OUTPUT_TMPL = "/pm_helmet/image_annotated_{idx}"
 
 DEFAULT_CONF_THRES = 0.25
 DEFAULT_IOU_THRES  = 0.5
@@ -88,21 +103,21 @@ DEFAULT_NO_HELMET_COOLDOWN_SEC = 10.0
 
 DEFAULT_DEVICE = ""        # "", "cpu", "cuda:0"
 DEFAULT_PREVIEW = False
-DEFAULT_IMGSZ = 0         # 0 → keep original size (Ultralytics default)
+DEFAULT_IMGSZ = 0         # 0 → Ultralytics default
 
-# ---- VLM (InternVL Only) defaults
+# ---- VLM (InternVL Only)
 DEFAULT_VLM_ENABLE = True
 DEFAULT_VLM_MODEL  = "OpenGVLab/InternVL3-1B"
 DEFAULT_VLM_DEVICE_MAP = "auto"     # 'auto' | 'None' | JSON string
 DEFAULT_VLM_MAXTOK = 64
 DEFAULT_VLM_COND   = "event"        # 'event' | 'any'
 DEFAULT_VLM_LANG   = "ko"           # 'ko' | 'en'
-DEFAULT_VLM_SAVE_IMG = True         # Save caption image (annotated/original chosen below)
-DEFAULT_VLM_MIN_INTERVAL = 1.5      # In 'any' mode, minimum QA interval (sec)
-DEFAULT_VLM_CLIP_SEC = 2.0          # Clip length for QA around event (sec)
+DEFAULT_VLM_SAVE_IMG = True         # save caption image
+DEFAULT_VLM_MIN_INTERVAL = 1.5      # in 'any' mode
+DEFAULT_VLM_CLIP_SEC = 2.0          # seconds of frames for QA
 DEFAULT_VLM_SEGMENTS = 8            # run_frames_inference num_segments
 DEFAULT_VLM_MAX_NUM  = 1            # InternVL tiling upper bound
-DEFAULT_VLM_TARGET_FPS = 15.0       # Estimated FPS for buffer sizing
+DEFAULT_VLM_TARGET_FPS = 15.0       # estimated FPS for buffer sizing
 
 # Visualization colors (BGR)
 COLOR_PM      = (255, 160, 0)
@@ -128,7 +143,6 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
 
     # Vectorized IoU
     def _box_iou(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # a: [M,4], b: [N,4] with (x1,y1,x2,y2)
         a = a.float()
         b = b.float()
         tl = torch.max(a[:, None, :2], b[None, :, :2])       # [M,N,2]
@@ -141,30 +155,21 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
         return inter / union
 
     def _nms_fallback(boxes: torch.Tensor, scores: torch.Tensor, iou_thres: float) -> torch.Tensor:
-        """
-        Pure-PyTorch NMS.
-        boxes: [N,4], scores: [N]
-        return: keep indices (LongTensor)
-        """
         if boxes.numel() == 0:
             return boxes.new_zeros((0,), dtype=torch.long)
-
         device = boxes.device
         boxes = boxes.to(dtype=torch.float32)
         scores = scores.to(dtype=torch.float32)
-
         order = torch.argsort(scores, descending=True)
         keep = []
-
         while order.numel() > 0:
             i = order[0]
             keep.append(i)
             if order.numel() == 1:
                 break
-            ious = _box_iou(boxes[i].unsqueeze(0), boxes[order[1:]])[0]  # [N-1]
+            ious = _box_iou(boxes[i].unsqueeze(0), boxes[order[1:]])[0]
             remain = (ious <= float(iou_thres)).nonzero(as_tuple=False).squeeze(1)
             order = order[1:][remain]
-
         return torch.tensor(keep, dtype=torch.long, device=device)
 
     patched = False
@@ -174,18 +179,18 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
             torchvision.ops.nms = _nms_fallback
             patched = True
         except Exception:
-            patched = True  # torchvision may be absent; fallback only
+            patched = True
     else:
         try:
             import torchvision
             try:
                 _ = torchvision.ops.nms(torch.zeros((1, 4)), torch.zeros((1,)), 0.5)
-                patched = False  # C++ NMS works
+                patched = False
             except Exception:
                 torchvision.ops.nms = _nms_fallback
                 patched = True
         except Exception:
-            patched = True  # torchvision import failed → fallback only
+            patched = True
 
     if patched:
         print("[WARN] Using pure-PyTorch NMS fallback (torchvision C++ ops unavailable).")
@@ -196,6 +201,7 @@ def _install_torchvision_nms_fallback(force: bool = False) -> bool:
 
 # Apply NMS fallback before using YOLO
 _install_torchvision_nms_fallback()
+
 
 # ======================
 # VLM helpers (frames→video fallback)
@@ -225,7 +231,7 @@ def _vlm_call_on_frames(
     Try InternVL with two generation configs:
       1) without 'use_cache'
       2) with use_cache=True
-    For each config, try frames→video (fallback) in order.
+    For each config, try frames→video fallback in order.
     """
     if not frames:
         return []
@@ -275,13 +281,10 @@ def _vlm_call_on_frames(
             print(f"[VLM] video inference failed ({'use_cache' in cfg}): {e}")
             return None
 
-    # Try frames first
     for cfg in cfg_candidates:
         qa = _try_frames(cfg)
         if qa:
             return qa
-
-    # Fallback to video
     for cfg in cfg_candidates:
         qa = _try_video(cfg)
         if qa:
@@ -292,16 +295,40 @@ def _vlm_call_on_frames(
 
 
 # ======================
+# Camera context (per camera)
+# ======================
+@dataclass
+class CamContext:
+    idx: int
+    input_topic: str
+    output_topic: str
+    pub: object
+    tracker: SimpleHelmetTracker
+    processing: bool = False
+    recent_frames: Deque[Tuple[np.ndarray, float]] = field(default_factory=deque)
+    last_hazard_log_time: Dict[str, float] = field(default_factory=lambda: {
+        "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0, "crowd": 0.0
+    })
+    last_qa_t: float = -1e9
+
+
+# ======================
 # ROS2 node
 # ======================
 class PMHelmetNode(Node):
     def __init__(self):
-        super().__init__("pm_helmet_inference_vote_log")
+        super().__init__("pm_helmet_inference_vote_log_multi")
 
         # ---- ROS parameter declarations
         self.declare_parameter("weights", DEFAULT_WEIGHTS)
+
+        # Legacy single-camera
         self.declare_parameter("input_topic", DEFAULT_INPUT_TOPIC)
         self.declare_parameter("output_topic", DEFAULT_OUTPUT_TOPIC)
+
+        self.declare_parameter("camera_count", DEFAULT_CAMERA_COUNT)
+        self.declare_parameter("input_topic_tmpl", DEFAULT_INPUT_TMPL)
+        self.declare_parameter("output_topic_tmpl", DEFAULT_OUTPUT_TMPL)
 
         self.declare_parameter("conf_thres", DEFAULT_CONF_THRES)
         self.declare_parameter("iou_thres", DEFAULT_IOU_THRES)
@@ -341,10 +368,15 @@ class PMHelmetNode(Node):
         self.declare_parameter("vlm_max_num", DEFAULT_VLM_MAX_NUM)
         self.declare_parameter("vlm_target_fps", DEFAULT_VLM_TARGET_FPS)
 
-        # ---- Get parameters
+        # ---- Read parameters
         self.weights = self.get_parameter("weights").value
-        self.input_topic = self.get_parameter("input_topic").value
-        self.output_topic = self.get_parameter("output_topic").value
+
+        self.single_input_topic = self.get_parameter("input_topic").value
+        self.single_output_topic = self.get_parameter("output_topic").value
+
+        self.camera_count = int(self.get_parameter("camera_count").value)
+        self.input_topic_tmpl = self.get_parameter("input_topic_tmpl").value
+        self.output_topic_tmpl = self.get_parameter("output_topic_tmpl").value
 
         self.conf_thres = float(self.get_parameter("conf_thres").value)
         self.iou_thres  = float(self.get_parameter("iou_thres").value)
@@ -409,11 +441,7 @@ class PMHelmetNode(Node):
         self.ids = resolve_class_ids(self.model)
         self.get_logger().info(f"Resolved class ids: {self.ids}")
 
-        # Tracker (majority vote)
-        self.tracker = SimpleHelmetTracker(vote_window=vw, vote_min_valid=vm, vote_threshold=vt,
-                                           iou_thresh=ti, max_age_frames=ta)
-
-        # QoS & I/O
+        # QoS
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -422,30 +450,7 @@ class PMHelmetNode(Node):
 
         self.bridge = CvBridge()
 
-        # Input topic type autodetection
-        if self.input_topic.endswith("/compressed"):
-            self.sub_compressed = self.create_subscription(CompressedImage, self.input_topic, self.compressed_cb, qos)
-            self.sub_image = None
-            self.get_logger().info(f"Subscribed: {self.input_topic} (CompressedImage)")
-        else:
-            self.sub_image = self.create_subscription(Image, self.input_topic, self.image_cb, qos)
-            compressed_topic = self.input_topic + "/compressed"
-            self.sub_compressed = self.create_subscription(CompressedImage, compressed_topic, self.compressed_cb, qos)
-            self.get_logger().info(f"Subscribed: {self.input_topic} (Image) and {compressed_topic} (CompressedImage)")
-
-        self.pub = self.create_publisher(Image, self.output_topic, qos)
-        self.get_logger().info(f"Publishing annotated image: {self.output_topic}")
-        self.get_logger().info(f"CONF_THRES={self.conf_thres}, IOU_THRES={self.iou_thres}, vote_window={vw}, vote_min_valid={vm}, vote_threshold={vt}")
-
-        # Processing flag (simple backpressure)
-        self.processing = False
-
-        # Hazard log cooldown timestamps
-        self.last_hazard_log_time = {
-            "trash_bag": 0.0, "fire": 0.0, "smoke": 0.0, "weapon": 0.0, "crowd": 0.0,
-        }
-
-        # ====== VLM loading/buffer/logging ======
+        # ====== VLM loading/logging dirs ======
         self.vlm_model = None
         self.vlm_tokenizer = None
         self.gen_cfg_dict = dict(
@@ -458,26 +463,64 @@ class PMHelmetNode(Node):
         if self.vlm_enable:
             try:
                 self.vlm_model, self.vlm_tokenizer = vlm_init_model(self.vlm_model_name, device_map=self.vlm_device_map)
-                self.get_logger().info(f"[VLM] Loaded via video_vlm.init_model: {self.vlm_model_name} (device_map={self.vlm_device_map})")
+                self.get_logger().info(f"[VLM] Loaded: {self.vlm_model_name} (device_map={self.vlm_device_map})")
             except Exception as e:
                 self.get_logger().error(f"[VLM] load failed: {e}")
                 self.vlm_enable = False
 
-        # Recent frame buffer: (frame, recv_time_sec)
-        maxlen = max(1, int(self.vlm_target_fps * self.vlm_clip_sec * 2))
-        self.recent_frames = deque(maxlen=maxlen)
-
-        # VLM logging/images
         self.vlm_images_dir = self.log_dir / "vlm_images"
         self.vlm_images_dir.mkdir(parents=True, exist_ok=True)
         self.vlm_jsonl_path = self.log_dir / "vlm_qa.jsonl"
-        self._last_qa_t = -1e9
+
+        # ====== Build per-camera contexts, pubs, subs ======
+        self.cams: Dict[int, CamContext] = {}
+
+        def _expand_tmpl(tmpl: str, idx: int) -> str:
+            return tmpl.replace("{idx}", str(idx))
+
+        if self.camera_count <= 1:
+            # Legacy single-camera mode
+            input_topics = [self.single_input_topic]
+            output_topics = [self.single_output_topic]
+        else:
+            # Multi-camera using templates
+            input_topics  = [_expand_tmpl(self.input_topic_tmpl, i) for i in range(self.camera_count)]
+            output_topics = [_expand_tmpl(self.output_topic_tmpl, i) for i in range(self.camera_count)]
+
+        for i, (in_top, out_top) in enumerate(zip(input_topics, output_topics)):
+            pub = self.create_publisher(Image, out_top, qos)
+            ctx = CamContext(
+                idx=i,
+                input_topic=in_top,
+                output_topic=out_top,
+                pub=pub,
+                tracker=SimpleHelmetTracker(
+                    vote_window=vw, vote_min_valid=vm, vote_threshold=vt,
+                    iou_thresh=ti, max_age_frames=ta
+                ),
+                recent_frames=deque(maxlen=max(1, int(self.vlm_target_fps * self.vlm_clip_sec * 2)))
+            )
+            self.cams[i] = ctx
+
+            # Subscribe raw and/or compressed
+            if in_top.endswith("/compressed"):
+                self.create_subscription(CompressedImage, in_top, self._make_compressed_cb(i), qos)
+                self.get_logger().info(f"[cam{i}] Subscribed: {in_top} (CompressedImage) → {out_top}")
+            else:
+                self.create_subscription(Image, in_top, self._make_image_cb(i), qos)
+                comp = in_top + "/compressed"
+                self.create_subscription(CompressedImage, comp, self._make_compressed_cb(i), qos)
+                self.get_logger().info(f"[cam{i}] Subscribed: {in_top} (Image) and {comp} (CompressedImage) → {out_top}")
+
+        self.get_logger().info(
+            f"CONF_THRES={self.conf_thres}, IOU_THRES={self.iou_thres}, vote_window={vw}, "
+            f"vote_min_valid={vm}, vote_threshold={vt}"
+        )
 
     # ---------- Core inference + visualization ----------
-    def run_inference(self, frame):
+    def run_inference(self, frame: np.ndarray, tracker: SimpleHelmetTracker):
         h, w = frame.shape[:2]
 
-        # Keep only valid (non-None) class IDs; pass to Ultralytics if non-empty
         keep_ids = sorted({v for v in self.ids.values() if v is not None})
         pred_kwargs = dict(conf=self.conf_thres, iou=self.iou_thres, verbose=False)
         if keep_ids:
@@ -512,7 +555,7 @@ class PMHelmetNode(Node):
         smoke_boxes   = [xyxy[i] for i, c in enumerate(cls) if c == get("smoke")]      if get("smoke") is not None else []
         weapon_boxes  = [xyxy[i] for i, c in enumerate(cls) if c == get("weapon")]     if get("weapon") is not None else []
 
-        # Rider decision: PM (expanded ×2) IoU>0.01 with person
+        # Rider decision
         rider_flags = [False] * len(person_boxes)
         for pm in pm_boxes:
             pm2 = expand_box(pm, factor=2.0, img_w=w, img_h=h)
@@ -532,8 +575,8 @@ class PMHelmetNode(Node):
                         inst_has_helmet[i] = True
                         break
 
-        # Majority-vote smoothing (tracker)
-        det_to_track = self.tracker.update(person_boxes, rider_flags, inst_has_helmet)
+        # Majority-vote smoothing
+        det_to_track = tracker.update(person_boxes, rider_flags, inst_has_helmet)
 
         # Visualization — PM
         for pm in pm_boxes:
@@ -543,7 +586,7 @@ class PMHelmetNode(Node):
 
         total_persons = len(person_boxes)
 
-        # Visualization — Rider (trackID + smoothed state)
+        # Visualization — Rider
         for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
             if not is_rider:
                 continue
@@ -557,7 +600,7 @@ class PMHelmetNode(Node):
             cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_RIDER, 2)
             draw_label(frame, x1, y1, label, COLOR_RIDER)
 
-        # Visualization — general Person (only when many people)
+        # Visualization — Persons when many
         if total_persons >= self.person_draw_min_count:
             for (pb, is_rider) in zip(person_boxes, rider_flags):
                 if is_rider:
@@ -644,19 +687,7 @@ class PMHelmetNode(Node):
         self._append_csv(fp, header, row)
 
     # ---------- VLM helpers ----------
-    def _recent_append(self, frame_bgr: np.ndarray, t_sec: float):
-        self.recent_frames.append((frame_bgr, float(t_sec)))
-
-    def _recent_clip_frames(self, now_t: float) -> List[np.ndarray]:
-        """Return frames within [now - clip_sec, now]. If empty, return the latest frame if available."""
-        t0 = now_t - self.vlm_clip_sec
-        frames = [f for (f, ts) in self.recent_frames if ts >= t0]
-        if not frames and self.recent_frames:
-            frames = [self.recent_frames[-1][0]]
-        return frames
-
     def _save_img_for_vlm(self, raw_bgr, vis_bgr, stem: str) -> str:
-        """Save an image for captioning (annotated or raw) and return its path."""
         img_path = self.vlm_images_dir / f"{stem}.jpg"
         try:
             cv2.imwrite(str(img_path), vis_bgr if self.vlm_save_img else raw_bgr)
@@ -664,12 +695,13 @@ class PMHelmetNode(Node):
         except Exception:
             return ""
 
-    def _log_vlm_qa(self, stamp_meta, frame_idx: int, event_type: str, qa_list, extra=None, image_path=""):
+    def _log_vlm_qa(self, cam: CamContext, stamp_meta, event_type: str, qa_list, extra=None, image_path=""):
         """Append a VLM QA record into logs/vlm_qa.jsonl."""
         rec = {
             "stamp_iso": stamp_meta["iso"],
             "ros_stamp": {"sec": int(stamp_meta["sec"]), "nsec": int(stamp_meta["nsec"])},
-            "frame_idx": frame_idx,
+            "camera_idx": cam.idx,
+            "input_topic": cam.input_topic,
             "event": event_type,
             "image_path": image_path,
             "qa": qa_list,
@@ -684,7 +716,7 @@ class PMHelmetNode(Node):
             self.get_logger().error(f"[VLM] jsonl append failed: {e}")
 
     def _build_hint(self, event_type: str, total_persons: int, stats: dict, det_to_track: dict) -> str:
-        """Compose a concise hint string summarizing scene context for InternVL."""
+        """Compose a concise hint summarizing scene context for InternVL."""
         rider_flags = stats.get("rider_flags", [])
         inst_has_helmet = stats.get("inst_has_helmet", [])
         helmet_on = helmet_off = helmet_unknown = 0
@@ -713,18 +745,18 @@ class PMHelmetNode(Node):
         )
         return hint
 
-    # ---------- Unified processing/publish ----------
-    def _process_and_publish(self, frame, header):
+    # ---------- Unified processing/publish per camera ----------
+    def _process_and_publish_cam(self, cam: CamContext, frame: np.ndarray, header):
         # 1) Timestamp + push original frame into recent buffer
         stamp_meta = self._stamp_to_meta(header.stamp if header else None)
         now_t = stamp_meta["t"]
-        self._recent_append(frame.copy(), now_t)
+        cam.recent_frames.append((frame.copy(), float(now_t)))
 
         # 2) Run inference/visualization on a copy
         work = frame.copy()
-        vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats = self.run_inference(work)
+        vis, total_persons, trash_boxes, fire_boxes, smoke_boxes, weapon_boxes, person_boxes, stats = \
+            self.run_inference(work, cam.tracker)
 
-        # Determine if any detection exists
         any_detection = (
             total_persons > 0 or
             stats["trash_count"] > 0 or
@@ -736,7 +768,15 @@ class PMHelmetNode(Node):
         det_to_track = stats["det_to_track"]
         rider_flags = stats["rider_flags"]
 
-        # (A) No-helmet (majority vote) — log on state transition (per-track cooldown) + VLM
+        # Helper: get recent frames for VLM
+        def _recent_clip_frames():
+            t0 = now_t - self.vlm_clip_sec
+            frames = [f for (f, ts) in cam.recent_frames if ts >= t0]
+            if not frames and cam.recent_frames:
+                frames = [cam.recent_frames[-1][0]]
+            return frames
+
+        # (A) No-helmet transition → CSV + VLM
         for det_idx, (pb, is_rider) in enumerate(zip(person_boxes, rider_flags)):
             if not is_rider:
                 continue
@@ -745,20 +785,19 @@ class PMHelmetNode(Node):
                 continue
             tid, smoothed, was_event = info
             if smoothed is False and was_event:
-                tr = next((t for t in self.tracker.tracks if t.tid == tid), None)
+                tr = next((t for t in cam.tracker.tracks if t.tid == tid), None)
                 if tr is None:
                     continue
                 if (now_t - tr.last_nohelmet_log_time) >= self.nohelmet_cooldown:
                     valid = [v for v in tr.votes if v is not None]
                     ratio = (sum(1 for v in valid if v) / len(valid)) if len(valid) > 0 else 0.0
                     self.log_no_helmet(stamp_meta, tid, pb, total_persons,
-                                       self.tracker.vote_window, len(valid),
-                                       self.tracker.vote_threshold, ratio)
+                                       cam.tracker.vote_window, len(valid),
+                                       cam.tracker.vote_threshold, ratio)
                     tr.last_nohelmet_log_time = now_t
 
-                    # VLM (on 'event' mode, or 'any' mode with detection)
                     if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
-                        frames_for_vlm = self._recent_clip_frames(now_t)
+                        frames_for_vlm = _recent_clip_frames()
                         hint = self._build_hint("no_helmet", total_persons, stats, det_to_track)
                         qa = _vlm_call_on_frames(
                             self.vlm_model, self.vlm_tokenizer, frames_for_vlm,
@@ -766,7 +805,7 @@ class PMHelmetNode(Node):
                             max_num=self.vlm_max_num, fps_for_fallback=self.vlm_target_fps,
                             prompt=None, lang=self.vlm_lang, hint=hint
                         )
-                        stem = f"ros_f{int(now_t*1000):013d}_nohelmet"
+                        stem = f"cam{cam.idx}_{int(now_t*1000):013d}_nohelmet"
                         img_path = self._save_img_for_vlm(frame, vis, stem) if self.vlm_save_img else ""
                         extra = {
                             "persons": total_persons,
@@ -777,10 +816,9 @@ class PMHelmetNode(Node):
                             "track_id": int(tid),
                             "event_detail": "no_helmet_transition"
                         }
-                        self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="no_helmet",
-                                         qa_list=qa, extra=extra, image_path=img_path)
+                        self._log_vlm_qa(cam, stamp_meta, "no_helmet", qa, extra, img_path)
 
-        # (B) Crowd (persons ≥ threshold) + hazard logging (cooldown) + VLM
+        # (B) Crowd + Hazards
         is_crowd = (total_persons >= self.crowd_person_threshold)
         if is_crowd:
             hazards = [
@@ -789,13 +827,13 @@ class PMHelmetNode(Node):
                 ("smoke",     stats["smoke_count"]),
                 ("weapon",    stats["weapon_count"]),
             ]
-            any_hazard_present = any(count > 0 for _, count in hazards)
+            any_hazard_present = any(cnt > 0 for _, cnt in hazards)
 
-            # (B0) Call VLM even for crowd-only scenes (no explicit hazards) when cooldown allows
+            # (B0) Crowd-only VLM (cooldown by 'crowd')
             if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)) and not any_hazard_present:
-                last_t = self.last_hazard_log_time.get("crowd", 0.0)
+                last_t = cam.last_hazard_log_time.get("crowd", 0.0)
                 if (now_t - last_t) >= self.log_cooldown:
-                    frames_for_vlm = self._recent_clip_frames(now_t)
+                    frames_for_vlm = _recent_clip_frames()
                     hint = self._build_hint("crowd", total_persons, stats, det_to_track)
                     qa = _vlm_call_on_frames(
                         self.vlm_model, self.vlm_tokenizer, frames_for_vlm,
@@ -803,7 +841,7 @@ class PMHelmetNode(Node):
                         max_num=self.vlm_max_num, fps_for_fallback=self.vlm_target_fps,
                         prompt=None, lang=self.vlm_lang, hint=hint
                     )
-                    stem = f"ros_f{int(now_t*1000):013d}_crowd"
+                    stem = f"cam{cam.idx}_{int(now_t*1000):013d}_crowd"
                     img_path = self._save_img_for_vlm(frame, vis, stem) if self.vlm_save_img else ""
                     extra = {
                         "persons": total_persons,
@@ -813,21 +851,20 @@ class PMHelmetNode(Node):
                         "weapon": stats["weapon_count"],
                         "event_detail": "crowd_only"
                     }
-                    self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="crowd",
-                                     qa_list=qa, extra=extra, image_path=img_path)
-                    self.last_hazard_log_time["crowd"] = now_t
+                    self._log_vlm_qa(cam, stamp_meta, "crowd", qa, extra, img_path)
+                    cam.last_hazard_log_time["crowd"] = now_t
 
-            # (B1) Log hazards when present (per-type cooldown) + VLM
-            for name, count in hazards:
-                if count <= 0:
+            # (B1) Hazards (per-type cooldown) + VLM
+            for name, cnt in hazards:
+                if cnt <= 0:
                     continue
-                last_t = self.last_hazard_log_time.get(name, 0.0)
+                last_t = cam.last_hazard_log_time.get(name, 0.0)
                 if (now_t - last_t) >= self.log_cooldown:
-                    self.log_hazard(stamp_meta, name, count, total_persons)
-                    self.last_hazard_log_time[name] = now_t
+                    self.log_hazard(stamp_meta, name, cnt, total_persons)
+                    cam.last_hazard_log_time[name] = now_t
 
                     if self.vlm_enable and (self.vlm_cond == "event" or (self.vlm_cond == "any" and any_detection)):
-                        frames_for_vlm = self._recent_clip_frames(now_t)
+                        frames_for_vlm = _recent_clip_frames()
                         hint = self._build_hint(f"hazard_{name}", total_persons, stats, det_to_track)
                         qa = _vlm_call_on_frames(
                             self.vlm_model, self.vlm_tokenizer, frames_for_vlm,
@@ -835,7 +872,7 @@ class PMHelmetNode(Node):
                             max_num=self.vlm_max_num, fps_for_fallback=self.vlm_target_fps,
                             prompt=None, lang=self.vlm_lang, hint=hint
                         )
-                        stem = f"ros_f{int(now_t*1000):013d}_{name}"
+                        stem = f"cam{cam.idx}_{int(now_t*1000):013d}_{name}"
                         img_path = self._save_img_for_vlm(frame, vis, stem) if self.vlm_save_img else ""
                         extra = {
                             "persons": total_persons,
@@ -845,13 +882,12 @@ class PMHelmetNode(Node):
                             "weapon": stats["weapon_count"],
                             "event_detail": f"hazard_{name}"
                         }
-                        self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type=name,
-                                         qa_list=qa, extra=extra, image_path=img_path)
+                        self._log_vlm_qa(cam, stamp_meta, name, qa, extra, img_path)
 
-        # (C) 'any' mode: run QA whenever there is any detection, respecting min interval
+        # (C) 'any' mode periodic QA
         if self.vlm_enable and self.vlm_cond == "any" and any_detection:
-            if (now_t - self._last_qa_t) >= self.vlm_min_interval:
-                frames_for_vlm = self._recent_clip_frames(now_t)
+            if (now_t - cam.last_qa_t) >= self.vlm_min_interval:
+                frames_for_vlm = _recent_clip_frames()
                 hint = self._build_hint("any_detection", total_persons, stats, det_to_track)
                 qa = _vlm_call_on_frames(
                     self.vlm_model, self.vlm_tokenizer, frames_for_vlm,
@@ -859,7 +895,7 @@ class PMHelmetNode(Node):
                     max_num=self.vlm_max_num, fps_for_fallback=self.vlm_target_fps,
                     prompt=None, lang=self.vlm_lang, hint=hint
                 )
-                stem = f"ros_f{int(now_t*1000):013d}_any"
+                stem = f"cam{cam.idx}_{int(now_t*1000):013d}_any"
                 img_path = self._save_img_for_vlm(frame, vis, stem) if self.vlm_save_img else ""
                 extra = {
                     "persons": total_persons,
@@ -869,47 +905,51 @@ class PMHelmetNode(Node):
                     "weapon": stats["weapon_count"],
                     "event_detail": "any_detection"
                 }
-                self._log_vlm_qa(stamp_meta, frame_idx=-1, event_type="any",
-                                 qa_list=qa, extra=extra, image_path=img_path)
-                self._last_qa_t = now_t
+                self._log_vlm_qa(cam, stamp_meta, "any", qa, extra, img_path)
+                cam.last_qa_t = now_t
 
         # Publish annotated image
         out = self.bridge.cv2_to_imgmsg(vis, encoding="bgr8")
         if header:
             out.header = header
-        self.pub.publish(out)
+        cam.pub.publish(out)
 
-        # Optional preview window
         if self.preview:
-            cv2.imshow("PM/Rider/Helmet (ROS2)", vis)
+            cv2.imshow(f"PM/Rider/Helmet (ROS2 cam{cam.idx})", vis)
             cv2.waitKey(1)
 
-    # ---------- ROS callbacks ----------
-    def image_cb(self, msg: Image):
-        if self.processing:
-            return
-        self.processing = True
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            self._process_and_publish(frame, msg.header)
-        except Exception as e:
-            self.get_logger().error(f"inference error: {e}")
-        finally:
-            self.processing = False
+    # ---------- ROS subscription callbacks (per camera) ----------
+    def _make_image_cb(self, cam_idx: int):
+        def _cb(msg: Image):
+            cam = self.cams[cam_idx]
+            if cam.processing:
+                return
+            cam.processing = True
+            try:
+                frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+                self._process_and_publish_cam(cam, frame, msg.header)
+            except Exception as e:
+                self.get_logger().error(f"[cam{cam_idx}] inference error: {e}")
+            finally:
+                cam.processing = False
+        return _cb
 
-    def compressed_cb(self, msg: CompressedImage):
-        if self.processing:
-            return
-        self.processing = True  # simple backpressure
-        try:
-            frame = self.bridge.compressed_imgmsg_to_cv2(msg)
-            if frame.ndim == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            self._process_and_publish(frame, msg.header)
-        except Exception as e:
-            self.get_logger().error(f"inference error (compressed): {e}")
-        finally:
-            self.processing = False
+    def _make_compressed_cb(self, cam_idx: int):
+        def _cb(msg: CompressedImage):
+            cam = self.cams[cam_idx]
+            if cam.processing:
+                return
+            cam.processing = True
+            try:
+                frame = self.bridge.compressed_imgmsg_to_cv2(msg)
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                self._process_and_publish_cam(cam, frame, msg.header)
+            except Exception as e:
+                self.get_logger().error(f"[cam{cam_idx}] inference error (compressed): {e}")
+            finally:
+                cam.processing = False
+        return _cb
 
 
 # ======================
