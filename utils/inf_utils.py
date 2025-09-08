@@ -218,3 +218,21 @@ def resolve_class_ids(model) -> Dict[str, int]:
             f"[ERROR] Required classes missing: {missing} | model.names={id_to_name}"
         )
     return ids
+
+def _expand_box_xy(box, x_factor: float, y_factor: float, img_w: int, img_h: int):
+    """가로/세로를 서로 다른 배율로 확장한 박스 (x1, y1, x2, y2) 를 반환합니다.
+    - box: (x1, y1, x2, y2), float/int
+    - x_factor, y_factor: 가로/세로 확장 배율 (>= 1.0 권장)
+    - img_w, img_h: 이미지 경계 클램프용 크기
+    """
+    x1, y1, x2, y2 = map(float, box)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = (x2 - x1) * max(x_factor, 1.0)
+    h = (y2 - y1) * max(y_factor, 1.0)
+
+    nx1 = max(0.0, cx - 0.5 * w)
+    ny1 = max(0.0, cy - 0.5 * h)
+    nx2 = min(float(max(1, img_w) - 1), cx + 0.5 * w)
+    ny2 = min(float(max(1, img_h) - 1), cy + 0.5 * h)
+    return (nx1, ny1, nx2, ny2)
