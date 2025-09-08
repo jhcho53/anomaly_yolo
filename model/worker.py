@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Tuple
 
 from ultralytics import YOLO
 import torch
+from utils.log import _video_stamp_meta, log_hazard, log_no_helmet
 
 class HazardWorker(threading.Thread):
     """trash/fire/smoke/weapon + rider(2인 이상/헬멧 미착용) 처리."""
