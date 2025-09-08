@@ -349,7 +349,7 @@ class PMHelmetNode(Node):
         self.declare_parameter("vote_window", DEFAULT_VOTE_WINDOW)
         self.declare_parameter("vote_min_valid", DEFAULT_VOTE_MIN_VALID)
         self.declare_parameter("vote_threshold", DEFAULT_VOTE_THRESHOLD)
-        self.declare_parameter("track_iou_thresh", DEFAULT_TRACK_IOU_THRES)
+        self.declare_parameter("track_iou_thresh", DEFAULT_TRACK_IOU_THRESH)
         self.declare_parameter("track_max_age_frames", DEFAULT_TRACK_MAX_AGE_FRAMES)
 
         # Crowd voting params
