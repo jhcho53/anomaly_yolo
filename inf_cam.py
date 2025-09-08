@@ -267,7 +267,7 @@ def _vlm_call_on_frames(
 # Crowd voter
 # ======================
 class BinaryVoter:
-    """최근 프레임 기반 이진 투표 스무딩 (window/min_valid/threshold + cooldown은 외부에서 관리)."""
+    """최근 프레임 기반 이진 투표 스무딩 (window/min_valid/threshold)."""
     def __init__(self, window: int, min_valid: int, threshold: float):
         self.window = deque(maxlen=int(window))
         self.min_valid = int(min_valid)
@@ -349,7 +349,7 @@ class PMHelmetNode(Node):
         self.declare_parameter("vote_window", DEFAULT_VOTE_WINDOW)
         self.declare_parameter("vote_min_valid", DEFAULT_VOTE_MIN_VALID)
         self.declare_parameter("vote_threshold", DEFAULT_VOTE_THRESHOLD)
-        self.declare_parameter("track_iou_thresh", DEFAULT_TRACK_IOU_THRESH)
+        self.declare_parameter("track_iou_thresh", DEFAULT_TRACK_IOU_THRES)
         self.declare_parameter("track_max_age_frames", DEFAULT_TRACK_MAX_AGE_FRAMES)
 
         # Crowd voting params
@@ -932,6 +932,7 @@ class PMHelmetNode(Node):
                         self._log_vlm_qa(cam, stamp_meta, "multi_rider", qa, extra, img_path)
             else:
                 # 해당 PM의 다른 key들은 자연 소멸(프레임 그룹 변화)되므로 별도 초기화는 생략
+                pass
 
         # ============ (C) Crowd voting + Hazards ============
         is_crowd = (stats["total_persons"] >= self.crowd_person_threshold)
