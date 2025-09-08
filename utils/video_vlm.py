@@ -387,7 +387,7 @@ def prepare_video_prompts(num_patches_list):
 
 # --------------------- BBox-focused single prompt --------------------- #
 _DEFAULT_PROMPT_EN = (
-    "In one concise sentence, summarize the scene from a safety perspective with a bounding‑box focus."
+    "In one concise sentence, Describe the bounding box object criteria."
 )
 _DEFAULT_PROMPT_KO = (
     "안전 관점에서 바운딩 박스를 중심으로 장면을 한 문장으로 간결하게 요약하세요."
